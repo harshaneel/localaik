@@ -61,7 +61,7 @@ jobs:
             latest: false
             model_url: https://huggingface.co/lmstudio-community/gemma-3-12b-it-GGUF/resolve/ed6e7d1e8c65a0181cd45e3a194722d1c651f06e/gemma-3-12b-it-Q4_K_M.gguf
             model_sha256: 9610e3e07375303f6cd89086b496bcc1ab581177f52042eff536475a29283ba2
-            mmproj_url: https://huggingface.co/lmstudio-community/gemma-3-12b-it-GGUF/resolve/21d023c2ddacdbb016424b194fe34ca0114b2600/mmproj-model-f16.gguf
+            mmproj_url: https://huggingface.co/lmstudio-community/gemma-3-12b-it-GGUF/resolve/785c151b0dabf00cfaff1421239fafdbb8e5995d/mmproj-model-f16.gguf
             mmproj_sha256: 30c02d056410848227001830866e0a269fcc28aaf8ca971bded494003de9f5a5
     permissions:
       contents: read
