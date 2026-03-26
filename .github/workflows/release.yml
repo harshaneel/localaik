@@ -1,0 +1,122 @@
+name: ci-release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run lint
+        run: make lint
+
+      - name: Start test container
+        run: make docker-up IMAGE=localaik-ci:test CONTAINER_NAME=localaik-ci BUILD_IMAGE=1 PORT=18090
+
+      - name: Wait for test container
+        run: |
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:18090/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs localaik-ci || true
+          exit 1
+
+      - name: Run unit and integration tests
+        run: make test-unit test-integration
+
+      - name: Stop test container
+        if: always()
+        run: make docker-down CONTAINER_NAME=localaik-ci
+
+  docker:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - variant: gemma3-4b
+            latest: true
+            model_url: https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/c536c4707e747055eecad7da65d46b6fb0ebaa79/gemma-3-4b-it-Q4_K_M.gguf
+            model_sha256: be49949e48422e4547b00af14179a193d3777eea7fbbd7d6e1b0861304628a01
+            mmproj_url: https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/d400f8ba80bfa661d94a756ea3b663db8b00da85/mmproj-model-f16.gguf
+            mmproj_sha256: 8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb
+          - variant: gemma3-12b
+            latest: false
+            model_url: https://huggingface.co/lmstudio-community/gemma-3-12b-it-GGUF/resolve/ed6e7d1e8c65a0181cd45e3a194722d1c651f06e/gemma-3-12b-it-Q4_K_M.gguf
+            model_sha256: 9610e3e07375303f6cd89086b496bcc1ab581177f52042eff536475a29283ba2
+            mmproj_url: https://huggingface.co/lmstudio-community/gemma-3-12b-it-GGUF/resolve/21d023c2ddacdbb016424b194fe34ca0114b2600/mmproj-model-f16.gguf
+            mmproj_sha256: 30c02d056410848227001830866e0a269fcc28aaf8ca971bded494003de9f5a5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: gokhalh/localaik
+          tags: |
+            type=raw,value=${{ matrix.variant }}
+            type=raw,value=${{ github.ref_name }}-${{ matrix.variant }}
+            type=raw,value=latest,enable=${{ matrix.latest }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MODEL_URL=${{ matrix.model_url }}
+            MODEL_SHA256=${{ matrix.model_sha256 }}
+            MMPROJ_URL=${{ matrix.mmproj_url }}
+            MMPROJ_SHA256=${{ matrix.mmproj_sha256 }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
