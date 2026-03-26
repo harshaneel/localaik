@@ -1,6 +1,6 @@
 .git
 .github
-localaik
+/localaik
 /.cache
 /tmp
 /specs
