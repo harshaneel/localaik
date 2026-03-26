@@ -1,16 +1,38 @@
 # localaik
 
-`localaik` is a local compatibility server for a subset of the Gemini and OpenAI APIs. Run one container, point your SDK at `http://localhost:8090`, and the proxy serves both protocol shapes on the same port for tests and development.
+[CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
+[Docker Hub](https://hub.docker.com/r/gokhalh/localaik)
+[License: MIT](LICENSE)
 
-Inside the container:
+A local compatibility server for the Gemini and OpenAI APIs. Run one container, point your SDK at `http://localhost:8090`, and get both protocol shapes on the same port for tests and development.
 
-- `localaik` exposes Gemini-compatible and OpenAI-compatible routes on one port.
-- `localaik` translates Gemini requests to OpenAI-compatible chat completions.
-- `localaik` forwards OpenAI chat-completions requests upstream with auth headers stripped.
-- `llama.cpp` serves a bundled Gemma model on an internal port.
-- `pdftoppm` renders Gemini PDF uploads into page images before forwarding them to the model.
+## How it works
+
+```
+┌────────────────────────────────────────────────────────┐
+│  localaik container                                    │
+│                                                        │
+│  ┌──────────────────────────┐    ┌──────────────────┐  │
+│  │  localaik proxy (:8090)  │    │ llama.cpp (:8080)│  │
+│  │                          │    │                  │  │
+│  │  /v1beta/* (Gemini)  ────┼──▶ │  Gemma 3 model   │  │
+│  │  /v1/*     (OpenAI)  ────┼──▶ │                  │  │
+│  │                          │    └──────────────────┘  │
+│  │                          │                          │
+│  │                          │    ┌──────────────────┐  │
+│  │  PDF uploads ────────────┼──▶ │    pdftoppm      │  │
+│  │                          │    │  PDF ─▶ images   │  │
+│  └──────────────────────────┘    └──────────────────┘  │
+└────────────────────────────────────────────────────────┘
+```
 
 ## Quick start
+
+```bash
+docker run -d -p 8090:8090 gokhalh/localaik
+```
+
+Or with Docker Compose:
 
 ```yaml
 services:
@@ -20,197 +42,138 @@ services:
       - "8090:8090"
 ```
 
-Gemini GenAI clients can usually work without code changes:
+localaik is a plain HTTP server, so any language or SDK that can set a base URL will work.
+
+### Gemini SDK
+
+**Go:**
+```go
+client, err := genai.NewClient(ctx, &genai.ClientConfig{
+    APIKey:      "test",
+    HTTPOptions: genai.HTTPOptions{BaseURL: "http://localhost:8090"},
+})
+```
+
+**Python:**
+```python
+from google import genai
+
+client = genai.Client(
+    api_key="test",
+    http_options=genai.types.HttpOptions(api_version="v1beta", base_url="http://localhost:8090"),
+)
+```
+
+Or set the environment variable for any language:
 
 ```bash
 export GOOGLE_GEMINI_BASE_URL=http://localhost:8090
 ```
 
-```go
-client, err := genai.NewClient(ctx, &genai.ClientConfig{
-    // `APIKey` is only present to match the SDK request shape.
-    APIKey: "test",
-    HTTPOptions: genai.HTTPOptions{
-        BaseURL: "http://localhost:8090",
-    },
-})
-```
+### OpenAI SDK
 
-OpenAI-compatible clients can usually work by pointing their `base_url` at `/v1`. Example:
-
+**Python:**
 ```python
 from openai import OpenAI
 
-client = OpenAI(
-  # `api_key` is only present to match the SDK request shape.
-  api_key="test",
-  base_url="http://localhost:8090/v1",
+client = OpenAI(api_key="test", base_url="http://localhost:8090/v1")
+```
+
+**Go:**
+```go
+client := openai.NewClient(
+    option.WithAPIKey("test"),
+    option.WithBaseURL("http://localhost:8090/v1"),
 )
 ```
 
-The snippets above are configuration examples. The pinned SDK versions covered by automated tests are listed below.
+## Docker tags
+
+
+| Tag                   | Model              | Image size |
+| --------------------- | ------------------ | ---------- |
+| `latest`, `gemma3-4b` | Gemma 3 4B Q4_K_M  | ~3 GB      |
+| `gemma3-12b`          | Gemma 3 12B Q4_K_M | ~7 GB      |
+
+
+Version-pinned tags follow the pattern `v0.1.1-gemma3-4b`, `v0.1.1-gemma3-12b`.
 
 ## Implemented routes
 
-`localaik` does not implement the full Gemini or OpenAI API surface. It implements the routes below and returns `404` for other API routes.
 
-| Route | Used by | Notes |
-| --- | --- | --- |
-| `POST /v1beta/models/{model}:generateContent` | Gemini GenAI `Models.GenerateContent` | Gemini request/response shape translated through upstream chat completions |
-| `POST /v1beta/models/{model}:streamGenerateContent` | Gemini GenAI `Models.GenerateContentStream` | Typically called with `?alt=sse`; response is Gemini-style SSE |
-| `POST /v1/chat/completions` | OpenAI chat-completions clients | Forwarded to upstream chat completions |
-| `GET /health` | `localaik` health checks | Custom route; not part of Gemini or OpenAI |
+| Route                                               | Used by                        | Notes                                   |
+| --------------------------------------------------- | ------------------------------ | --------------------------------------- |
+| `POST /v1beta/models/{model}:generateContent`       | Gemini `GenerateContent`       | Translated to upstream chat completions |
+| `POST /v1beta/models/{model}:streamGenerateContent` | Gemini `GenerateContentStream` | Gemini-style SSE (typically `?alt=sse`) |
+| `POST /v1/chat/completions`                         | OpenAI chat completions        | Forwarded to upstream                   |
+| `GET /health`                                       | Health checks                  | Custom route                            |
+
+
+All other API routes return `404`.
 
 ## Tested SDKs
 
-The automated SDK contract tests in this repo currently validate against these Go SDKs:
+Automated contract tests validate against:
 
-- `google.golang.org/genai` `v1.51.0`
-- `github.com/openai/openai-go/v3` `v3.30.0`
+- `google.golang.org/genai` v1.51.0
+- `github.com/openai/openai-go/v3` v3.30.0
 
-Other SDK versions and languages may work if they emit the same HTTP shapes, but only the versions above are part of this repo's automated coverage.
+Other SDK versions and languages may work if they emit the same HTTP shapes.
 
 ## Gemini compatibility
 
-Supported SDK methods:
+**Supported features:**
 
-- `Models.GenerateContent`
-- `Models.GenerateContentStream`
-
-Supported request and response features:
-
-- Text input
-- Image input via `inlineData`
-- PDF input via `inlineData` with automatic PDF-to-image conversion
-- `fileData` for image URLs plus local or `data:`-URI PDF/text files
+- Text, image (`inlineData`), and PDF input (auto-converted to page images)
+- `fileData` for image URLs and local/`data:`-URI PDF/text files
 - `systemInstruction`
-- `generationConfig.temperature`
-- `generationConfig.topP`
-- `generationConfig.topK`
-- `generationConfig.candidateCount`
-- `generationConfig.maxOutputTokens`
-- `generationConfig.stopSequences`
-- `generationConfig.responseLogprobs`
-- `generationConfig.logprobs`
-- `generationConfig.presencePenalty`
-- `generationConfig.frequencyPenalty`
-- `generationConfig.seed`
-- Structured output via `responseMimeType`, `responseSchema`, and `responseJsonSchema`
-- Function declarations via `tools`
-- Function calling config via `toolConfig.functionCallingConfig`
+- `generationConfig`: temperature, topP, topK, candidateCount, maxOutputTokens, stopSequences, responseLogprobs, logprobs, presencePenalty, frequencyPenalty, seed
+- Structured output via `responseMimeType`, `responseSchema`, `responseJsonSchema`
+- Function declarations via `tools`, function calling config via `toolConfig`
 - `functionCall` and `functionResponse` parts
-- `x-goog-api-key` accepted and ignored
-- Gemini-style streaming SSE responses
-- Usage metadata and finish reasons translated from upstream chat completions
+- Streaming SSE responses
+- Usage metadata and finish reasons
 
-Partial support:
+**Partial support:**
 
-- OpenAI-compatible upstream runtimes decide whether forwarded controls like `top_k`, `n`, logprobs, or tool choice are honored
-- `executableCode`, `codeExecutionResult`, `toolCall`, and `toolResponse` parts are preserved as text context rather than executed with native Gemini semantics
-- Gemini response translation focuses on text, function calls, finish reasons, and usage; richer Gemini metadata such as grounding, citations, safety details, and prompt feedback are not surfaced
+- `top_k`, `n`, logprobs, and tool choice behavior depends on the upstream runtime
+- `executableCode`, `codeExecutionResult`, `toolCall`, `toolResponse` parts preserved as text context
 
-Not supported:
+**Not supported:**
 
-- Other GenAI SDK methods and endpoints outside `GenerateContent` and `GenerateContentStream`
-- Non-function Gemini tools such as Google Search, Google Maps, URL context, and Gemini server-side code execution
-- Embeddings, token counting, cached content APIs, live/bidi sessions, uploads, and other Gemini endpoints outside the routes listed above
+- SDK methods outside `GenerateContent` / `GenerateContentStream`
+- Non-function tools (Google Search, Maps, URL context, code execution)
+- Embeddings, token counting, cached content, live/bidi sessions, uploads
 
 ## OpenAI compatibility
 
-Supported SDK methods:
+**Supported:** text chat completions, structured output, vision inputs, tool-related fields (all passed through to upstream).
 
-- `client.Chat.Completions.New`
-- Chat completions streaming
-
-Supported request and response features:
-
-- Text chat completions
-- Structured output fields passed through to upstream chat completions
-- Vision inputs passed through to upstream chat completions
-- Tool-related chat-completions fields passed through to upstream chat completions
-- `Authorization: Bearer ...` accepted and ignored
-
-Not supported:
-
-- Other OpenAI SDK methods and endpoints outside chat completions
-- Responses API
-- Assistants
-- Embeddings
-- Images
-- Audio
-- Files or uploads
-- Vector stores
+**Not supported:** Responses API, Assistants, Embeddings, Images, Audio, Files, Vector stores.
 
 ## Development
 
-Run the proxy locally:
-
 ```bash
+# Run the proxy locally (requires a running llama.cpp server)
 go run ./cmd/localaik --port 8090 --upstream http://127.0.0.1:8080/v1
+
+# Common commands
+make help              # Show all targets
+make lint              # Format check + go vet
+make test-unit         # Unit tests
+make test-integration  # Integration tests (requires docker-up)
+make test              # All of the above
+make docker-up         # Build and start container
+make docker-down       # Stop container
 ```
 
-Common development commands:
+### Building the image
 
 ```bash
-make lint
-make test-unit
-make test-integration
-make test
-make docker-up
-make docker-down
-```
-
-`make test-integration` assumes the container is already running, for example via `make docker-up`.
-
-`make docker-up` waits for `/health` before returning.
-
-Run image smoke tests against a locally built container:
-
-```bash
-IMAGE=gokhalh/localaik:test PORT=18090 CONTAINER_NAME=localaik-image-integration ./scripts/run-image-integration.sh
-```
-
-Reuse an existing image instead of rebuilding:
-
-```bash
-BUILD_IMAGE=0 IMAGE=gokhalh/localaik:latest PORT=18090 CONTAINER_NAME=localaik-image-integration ./scripts/run-image-integration.sh
-```
-
-Run a single image-backed test manually without cache:
-
-```bash
-go test -count=1 -tags=docker_integration ./integration -run '^TestImageHealth$$'
-```
-
-Run the container locally through Make:
-
-```bash
-make docker-up
-```
-
-Use a different port or image:
-
-```bash
-PORT=8090 IMAGE=gokhalh/localaik:latest BUILD_IMAGE=0 make docker-up
-```
-
-Stop it again:
-
-```bash
-make docker-down
-```
-
-## Building the image
-
-The default image bakes in the Gemma 3 4B Q4 model plus its multimodal projection weights:
-
-```bash
+# Default (Gemma 3 4B)
 docker build -t gokhalh/localaik .
-```
 
-The Dockerfile also supports alternate pinned model artifacts at build time:
-
-```bash
+# Custom model
 docker build \
   --build-arg MODEL_URL=... \
   --build-arg MODEL_SHA256=... \
@@ -219,15 +182,10 @@ docker build \
   -t gokhalh/localaik:custom .
 ```
 
-## Tags
-
-- `latest`, `gemma3-4b`: Gemma 3 4B Q4
-- `gemma3-12b`: Gemma 3 12B Q4
-
 ## Limitations
 
-- Intended for tests and development, not production.
-- Image size is dominated by model weights.
-- Cold starts can take tens of seconds while the model loads.
-- PDF rendering adds latency for each page.
-- Function calling is implemented through the chat-completions compatibility layer, but non-function Gemini tools and embeddings are still not implemented.
+- Intended for tests and development, not production
+- Image size is dominated by model weights
+- Cold starts can take tens of seconds while the model loads
+- PDF rendering adds latency per page
+
