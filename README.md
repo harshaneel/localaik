@@ -1,8 +1,8 @@
 # localaik
 
-[CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
-[Docker Hub](https://hub.docker.com/r/gokhalh/localaik)
-[License: MIT](LICENSE)
+[![CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml/badge.svg)](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
+[![Docker Hub](https://img.shields.io/docker/v/gokhalh/localaik?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/gokhalh/localaik)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A local compatibility server for the Gemini and OpenAI APIs. Run one container, point your SDK at `http://localhost:8090`, and get both protocol shapes on the same port for tests and development.
 
