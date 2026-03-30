@@ -47,61 +47,65 @@ func GeminiRequestToOpenAI(ctx context.Context, req gemini.GenerateContentReques
 		return openaip.ChatCompletionRequest{}, fmt.Errorf("Gemini request must include at least one message")
 	}
 
-	if cfg := req.GenerationConfig; cfg != nil {
-		result.TopP = cfg.TopP
-		if cfg.TopK != nil {
-			topK := int(*cfg.TopK)
-			result.TopK = &topK
-		}
-		result.N = cfg.CandidateCount
-		result.Temperature = cfg.Temperature
-		result.MaxTokens = cfg.MaxOutputTokens
-		result.PresencePenalty = cfg.PresencePenalty
-		result.FrequencyPenalty = cfg.FrequencyPenalty
-		result.Seed = cfg.Seed
-		if len(cfg.StopSequences) > 0 {
-			if len(cfg.StopSequences) == 1 {
-				result.Stop = cfg.StopSequences[0]
-			} else {
-				result.Stop = cfg.StopSequences
-			}
-		}
-		if cfg.ResponseLogprobs != nil && *cfg.ResponseLogprobs {
-			value := true
-			result.Logprobs = &value
-		}
-		if cfg.Logprobs != nil {
-			value := true
-			result.Logprobs = &value
-			result.TopLogprobs = cfg.Logprobs
-		}
-
-		schema := cfg.ResponseSchema
-		if schema == nil {
-			schema = cfg.ResponseJSONSchema
-		}
-
-		if schema != nil {
-			result.ResponseFormat = &openaip.ResponseFormat{
-				Type: "json_schema",
-				JSONSchema: &openaip.JSONSchemaConfig{
-					Name:   "response",
-					Schema: normalizeJSONSchema(schema),
-					Strict: true,
-				},
-			}
-		} else if strings.EqualFold(cfg.ResponseMimeType, "application/json") {
-			result.ResponseFormat = &openaip.ResponseFormat{
-				Type: "json_object",
-			}
-		}
-
-	}
+	applyGenerationConfig(req.GenerationConfig, &result)
 
 	result.Tools = geminiToolsToOpenAITools(req.Tools)
 	result.ToolChoice = geminiToolChoiceToOpenAI(req.ToolConfig)
 
 	return result, nil
+}
+
+func applyGenerationConfig(cfg *gemini.GenerationConfig, result *openaip.ChatCompletionRequest) {
+	if cfg == nil {
+		return
+	}
+	result.TopP = cfg.TopP
+	if cfg.TopK != nil {
+		topK := int(*cfg.TopK)
+		result.TopK = &topK
+	}
+	result.N = cfg.CandidateCount
+	result.Temperature = cfg.Temperature
+	result.MaxTokens = cfg.MaxOutputTokens
+	result.PresencePenalty = cfg.PresencePenalty
+	result.FrequencyPenalty = cfg.FrequencyPenalty
+	result.Seed = cfg.Seed
+	if len(cfg.StopSequences) > 0 {
+		if len(cfg.StopSequences) == 1 {
+			result.Stop = cfg.StopSequences[0]
+		} else {
+			result.Stop = cfg.StopSequences
+		}
+	}
+	if cfg.ResponseLogprobs != nil && *cfg.ResponseLogprobs {
+		value := true
+		result.Logprobs = &value
+	}
+	if cfg.Logprobs != nil {
+		value := true
+		result.Logprobs = &value
+		result.TopLogprobs = cfg.Logprobs
+	}
+
+	schema := cfg.ResponseSchema
+	if schema == nil {
+		schema = cfg.ResponseJSONSchema
+	}
+
+	if schema != nil {
+		result.ResponseFormat = &openaip.ResponseFormat{
+			Type: "json_schema",
+			JSONSchema: &openaip.JSONSchemaConfig{
+				Name:   "response",
+				Schema: normalizeJSONSchema(schema),
+				Strict: true,
+			},
+		}
+	} else if strings.EqualFold(cfg.ResponseMimeType, "application/json") {
+		result.ResponseFormat = &openaip.ResponseFormat{
+			Type: "json_object",
+		}
+	}
 }
 
 func OpenAIResponseToGemini(resp openaip.ChatCompletionResponse) gemini.GenerateContentResponse {
@@ -209,11 +213,13 @@ func geminiContentToOpenAIMessages(ctx context.Context, content gemini.Content, 
 		}
 	}
 
+	return assembleOpenAIMessages(geminiRoleToOpenAI(content.Role), contentParts, contentTextOnly, assistantToolCalls, toolMessages), nil
+}
+
+func assembleOpenAIMessages(role string, contentParts []openaip.ContentPart, contentTextOnly bool, assistantToolCalls []openaip.ToolCall, toolMessages []openaip.Message) []openaip.Message {
 	messages := make([]openaip.Message, 0, 1+len(toolMessages))
 	if len(contentParts) > 0 || len(assistantToolCalls) > 0 {
-		message := openaip.Message{
-			Role: geminiRoleToOpenAI(content.Role),
-		}
+		message := openaip.Message{Role: role}
 		if len(contentParts) > 0 {
 			message.Content = openAIContentFromParts(contentParts, contentTextOnly)
 		} else if len(assistantToolCalls) > 0 {
@@ -224,9 +230,8 @@ func geminiContentToOpenAIMessages(ctx context.Context, content gemini.Content, 
 		}
 		messages = append(messages, message)
 	}
-
 	messages = append(messages, toolMessages...)
-	return messages, nil
+	return messages
 }
 
 func geminiPartsToOpenAIContent(ctx context.Context, parts []gemini.Part, renderer pdf.Renderer) (any, error) {
@@ -465,6 +470,33 @@ func simplifyFunctionResponseParts(parts []gemini.FunctionResponsePart) []map[st
 	return out
 }
 
+func collectTextFromAnySlice(items []any) []string {
+	texts := make([]string, 0, len(items))
+	for _, item := range items {
+		switch piece := item.(type) {
+		case map[string]any:
+			if text, ok := piece["text"].(string); ok {
+				texts = append(texts, text)
+			}
+		case openaip.ContentPart:
+			if piece.Type == "text" && piece.Text != "" {
+				texts = append(texts, piece.Text)
+			}
+		}
+	}
+	return texts
+}
+
+func textFromMap(m map[string]any) (string, bool) {
+	if text, ok := m["text"].(string); ok {
+		return text, true
+	}
+	if content, ok := m["content"].(string); ok {
+		return content, true
+	}
+	return "", false
+}
+
 func openAIContentToGeminiParts(content any) []gemini.Part {
 	switch value := content.(type) {
 	case nil:
@@ -480,26 +512,15 @@ func openAIContentToGeminiParts(content any) []gemini.Part {
 		}
 		return parts
 	case []any:
-		parts := make([]gemini.Part, 0, len(value))
-		for _, item := range value {
-			switch piece := item.(type) {
-			case map[string]any:
-				if text, ok := piece["text"].(string); ok {
-					parts = append(parts, gemini.Part{Text: text})
-				}
-			case openaip.ContentPart:
-				if piece.Type == "text" && piece.Text != "" {
-					parts = append(parts, gemini.Part{Text: piece.Text})
-				}
-			}
+		texts := collectTextFromAnySlice(value)
+		parts := make([]gemini.Part, 0, len(texts))
+		for _, text := range texts {
+			parts = append(parts, gemini.Part{Text: text})
 		}
 		return parts
 	case map[string]any:
-		if text, ok := value["text"].(string); ok {
+		if text, ok := textFromMap(value); ok {
 			return textToGeminiParts(text)
-		}
-		if content, ok := value["content"].(string); ok {
-			return textToGeminiParts(content)
 		}
 	}
 	return textToGeminiParts(extractTextFromOpenAIContent(content))
@@ -613,26 +634,10 @@ func extractTextFromOpenAIContent(content any) string {
 		}
 		return strings.Join(parts, "")
 	case []any:
-		parts := make([]string, 0, len(value))
-		for _, item := range value {
-			switch piece := item.(type) {
-			case map[string]any:
-				if text, ok := piece["text"].(string); ok {
-					parts = append(parts, text)
-				}
-			case openaip.ContentPart:
-				if piece.Type == "text" && piece.Text != "" {
-					parts = append(parts, piece.Text)
-				}
-			}
-		}
-		return strings.Join(parts, "")
+		return strings.Join(collectTextFromAnySlice(value), "")
 	case map[string]any:
-		if text, ok := value["text"].(string); ok {
+		if text, ok := textFromMap(value); ok {
 			return text
-		}
-		if content, ok := value["content"].(string); ok {
-			return content
 		}
 	}
 

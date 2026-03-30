@@ -3,10 +3,17 @@
 [![CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml/badge.svg)](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
 [![Docker Hub](https://img.shields.io/docker/v/gokhalh/localaik?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/gokhalh/localaik)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/harshaneel/localaik)](https://goreportcard.com/report/github.com/harshaneel/localaik)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/harshaneel/localaik)](https://github.com/harshaneel/localaik/blob/main/go.mod)
+[![Go Reference](https://pkg.go.dev/badge/github.com/harshaneel/localaik.svg)](https://pkg.go.dev/github.com/harshaneel/localaik)
 
 A local compatibility server for the Gemini and OpenAI APIs. Run one container, point your SDK at `http://localhost:8090`, and get both protocol shapes on the same port for tests and development.
 
-## How it works
+## Motivation
+
+Testing code that calls Gemini or OpenAI is painful: real API calls are slow, cost money, and need network access. localaik gives you a single Docker container that speaks both protocols backed by a local model — no API key, no internet, deterministic enough for CI.
+
+## Architecture
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -25,6 +32,8 @@ A local compatibility server for the Gemini and OpenAI APIs. Run one container, 
 │  └──────────────────────────┘    └──────────────────┘  │
 └────────────────────────────────────────────────────────┘
 ```
+
+SDK requests hit the localaik proxy, which translates Gemini or OpenAI wire format and forwards to the local llama.cpp server running a Gemma 3 model.
 
 ## Quick start
 
@@ -120,6 +129,32 @@ Automated contract tests validate against:
 
 Other SDK versions and languages may work if they emit the same HTTP shapes.
 
+## Use in CI
+
+Run localaik as a GitHub Actions service container so your tests hit a real local model instead of mocks:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      localaik:
+        image: gokhalh/localaik
+        ports:
+          - 8090:8090
+        options: >-
+          --health-cmd "curl -f http://localhost:8090/health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test ./...
+        env:
+          GOOGLE_GEMINI_BASE_URL: http://localhost:8090
+          OPENAI_BASE_URL: http://localhost:8090/v1
+```
+
 ## Gemini compatibility
 
 **Supported features:**
@@ -152,6 +187,8 @@ Other SDK versions and languages may work if they emit the same HTTP shapes.
 **Not supported:** Responses API, Assistants, Embeddings, Images, Audio, Files, Vector stores.
 
 ## Development
+
+> **Tip:** Run `make docker-up` to build and start the localaik container, which includes a local llama.cpp server with a bundled model. This is the easiest way to get a working upstream for development.
 
 ```bash
 # Run the proxy locally (requires a running llama.cpp server)
