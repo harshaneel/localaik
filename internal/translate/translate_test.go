@@ -68,57 +68,39 @@ func TestGeminiRequestToOpenAI(t *testing.T) {
 		t.Fatalf("GeminiRequestToOpenAI returned error: %v", err)
 	}
 
-	if got.Model != DefaultOpenAIModel {
-		t.Fatalf("model = %q, want %q", got.Model, DefaultOpenAIModel)
-	}
-	if got.Temperature == nil || *got.Temperature != temp {
-		t.Fatalf("temperature = %#v, want %v", got.Temperature, temp)
-	}
-	if got.MaxTokens == nil || *got.MaxTokens != maxTokens {
-		t.Fatalf("maxTokens = %#v, want %d", got.MaxTokens, maxTokens)
-	}
-	if len(got.Messages) != 2 {
-		t.Fatalf("message count = %d, want 2", len(got.Messages))
-	}
-	if got.Messages[0].Role != "system" || got.Messages[0].Content != "Return JSON only." {
-		t.Fatalf("system message = %#v", got.Messages[0])
-	}
+	t.Run("basic fields", func(t *testing.T) {
+		if got.Model != DefaultOpenAIModel {
+			t.Fatalf("model = %q, want %q", got.Model, DefaultOpenAIModel)
+		}
+		requirePtrEqual(t, "temperature", got.Temperature, temp)
+		requirePtrEqual(t, "maxTokens", got.MaxTokens, maxTokens)
+	})
 
-	userParts, ok := got.Messages[1].Content.([]openaip.ContentPart)
-	if !ok {
-		t.Fatalf("user content type = %T, want []ContentPart", got.Messages[1].Content)
-	}
-	if len(userParts) != 4 {
-		t.Fatalf("user content parts = %d, want 4", len(userParts))
-	}
-	if userParts[0].Type != "text" || userParts[0].Text != "Describe this document" {
-		t.Fatalf("first part = %#v", userParts[0])
-	}
-	if userParts[1].Type != "image_url" || userParts[1].ImageURL == nil || userParts[1].ImageURL.URL == "" {
-		t.Fatalf("second part = %#v", userParts[1])
-	}
-	if userParts[2].ImageURL == nil || userParts[3].ImageURL == nil {
-		t.Fatalf("pdf parts missing image URLs: %#v", userParts)
-	}
-	if got.ResponseFormat == nil || got.ResponseFormat.Type != "json_schema" {
-		t.Fatalf("response format = %#v, want json_schema", got.ResponseFormat)
-	}
-	if got.ResponseFormat.JSONSchema == nil || got.ResponseFormat.JSONSchema.Name != "response" {
-		t.Fatalf("json schema config = %#v", got.ResponseFormat.JSONSchema)
-	}
-	wantSchema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"summary": map[string]any{"type": "string"},
-			"scores": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "integer"},
+	t.Run("messages", func(t *testing.T) {
+		assertGeminiReqMessages(t, got)
+	})
+
+	t.Run("response format", func(t *testing.T) {
+		if got.ResponseFormat == nil || got.ResponseFormat.Type != "json_schema" {
+			t.Fatalf("response format = %#v, want json_schema", got.ResponseFormat)
+		}
+		if got.ResponseFormat.JSONSchema == nil || got.ResponseFormat.JSONSchema.Name != "response" {
+			t.Fatalf("json schema config = %#v", got.ResponseFormat.JSONSchema)
+		}
+		wantSchema := map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"summary": map[string]any{"type": "string"},
+				"scores": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"type": "integer"},
+				},
 			},
-		},
-	}
-	if !reflect.DeepEqual(got.ResponseFormat.JSONSchema.Schema, wantSchema) {
-		t.Fatalf("normalized schema = %#v, want %#v", got.ResponseFormat.JSONSchema.Schema, wantSchema)
-	}
+		}
+		if !reflect.DeepEqual(got.ResponseFormat.JSONSchema.Schema, wantSchema) {
+			t.Fatalf("normalized schema = %#v, want %#v", got.ResponseFormat.JSONSchema.Schema, wantSchema)
+		}
+	})
 }
 
 func TestGeminiRequestToOpenAIJSONModeWithoutSchema(t *testing.T) {
@@ -238,78 +220,50 @@ func TestGeminiRequestToOpenAIWithFileDataAndTools(t *testing.T) {
 		t.Fatalf("GeminiRequestToOpenAI returned error: %v", err)
 	}
 
-	if got.TopP == nil || *got.TopP != topP {
-		t.Fatalf("top_p = %#v, want %v", got.TopP, topP)
-	}
-	if got.TopK == nil || *got.TopK != int(topK) {
-		t.Fatalf("top_k = %#v, want %d", got.TopK, int(topK))
-	}
-	if got.N == nil || *got.N != candidateCount {
-		t.Fatalf("n = %#v, want %d", got.N, candidateCount)
-	}
-	if got.Stop == nil {
-		t.Fatalf("stop = nil, want stop sequences")
-	}
-	if got.Logprobs == nil || !*got.Logprobs {
-		t.Fatalf("logprobs = %#v, want true", got.Logprobs)
-	}
-	if got.TopLogprobs == nil || *got.TopLogprobs != logprobs {
-		t.Fatalf("top_logprobs = %#v, want %d", got.TopLogprobs, logprobs)
-	}
-	if got.PresencePenalty == nil || *got.PresencePenalty != presencePenalty {
-		t.Fatalf("presence_penalty = %#v, want %v", got.PresencePenalty, presencePenalty)
-	}
-	if got.FrequencyPenalty == nil || *got.FrequencyPenalty != frequencyPenalty {
-		t.Fatalf("frequency_penalty = %#v, want %v", got.FrequencyPenalty, frequencyPenalty)
-	}
-	if got.Seed == nil || *got.Seed != seed {
-		t.Fatalf("seed = %#v, want %d", got.Seed, seed)
-	}
-	if len(got.Messages) != 3 {
-		t.Fatalf("message count = %d, want 3", len(got.Messages))
-	}
+	t.Run("generation config", func(t *testing.T) {
+		requirePtrEqual(t, "top_p", got.TopP, topP)
+		requirePtrEqual(t, "top_k", got.TopK, int(topK))
+		requirePtrEqual(t, "n", got.N, candidateCount)
+		if got.Stop == nil {
+			t.Fatalf("stop = nil, want stop sequences")
+		}
+		if got.Logprobs == nil || !*got.Logprobs {
+			t.Fatalf("logprobs = %#v, want true", got.Logprobs)
+		}
+		requirePtrEqual(t, "top_logprobs", got.TopLogprobs, logprobs)
+		requirePtrEqual(t, "presence_penalty", got.PresencePenalty, presencePenalty)
+		requirePtrEqual(t, "frequency_penalty", got.FrequencyPenalty, frequencyPenalty)
+		requirePtrEqual(t, "seed", got.Seed, seed)
+	})
 
-	userParts, ok := got.Messages[0].Content.([]openaip.ContentPart)
-	if !ok || len(userParts) != 2 {
-		t.Fatalf("user content = %#v, want text+image parts", got.Messages[0].Content)
-	}
-	if userParts[1].ImageURL == nil || userParts[1].ImageURL.URL == "" {
-		t.Fatalf("translated fileData part = %#v", userParts[1])
-	}
+	t.Run("messages", func(t *testing.T) {
+		assertGeminiReqToolMessages(t, got)
+	})
 
-	if got.Messages[1].Role != "assistant" || len(got.Messages[1].ToolCalls) != 1 {
-		t.Fatalf("assistant tool call message = %#v", got.Messages[1])
-	}
-	if got.Messages[1].ToolCalls[0].Function == nil || got.Messages[1].ToolCalls[0].Function.Name != "lookup_weather" {
-		t.Fatalf("assistant tool call = %#v", got.Messages[1].ToolCalls[0])
-	}
+	t.Run("tools", func(t *testing.T) {
+		if len(got.Tools) != 1 || got.Tools[0].Function == nil {
+			t.Fatalf("tools = %#v, want one function tool", got.Tools)
+		}
+		wantParameters := map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"city": map[string]any{"type": "string"},
+			},
+			"required": []any{"city"},
+		}
+		if !reflect.DeepEqual(got.Tools[0].Function.Parameters, wantParameters) {
+			t.Fatalf("tool parameters = %#v, want %#v", got.Tools[0].Function.Parameters, wantParameters)
+		}
 
-	if got.Messages[2].Role != "tool" || got.Messages[2].ToolCallID != "call_lookup" {
-		t.Fatalf("tool message = %#v", got.Messages[2])
-	}
-
-	if len(got.Tools) != 1 || got.Tools[0].Function == nil {
-		t.Fatalf("tools = %#v, want one function tool", got.Tools)
-	}
-	wantParameters := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"city": map[string]any{"type": "string"},
-		},
-		"required": []any{"city"},
-	}
-	if !reflect.DeepEqual(got.Tools[0].Function.Parameters, wantParameters) {
-		t.Fatalf("tool parameters = %#v, want %#v", got.Tools[0].Function.Parameters, wantParameters)
-	}
-
-	toolChoice, ok := got.ToolChoice.(map[string]any)
-	if !ok {
-		t.Fatalf("tool_choice = %#v, want function selector", got.ToolChoice)
-	}
-	function, ok := toolChoice["function"].(map[string]any)
-	if !ok || function["name"] != "lookup_weather" {
-		t.Fatalf("tool_choice function = %#v", got.ToolChoice)
-	}
+		toolChoice, ok := got.ToolChoice.(map[string]any)
+		if !ok {
+			t.Fatalf("tool_choice = %#v, want function selector", got.ToolChoice)
+		}
+		function, ok := toolChoice["function"].(map[string]any)
+		if !ok || function["name"] != "lookup_weather" {
+			t.Fatalf("tool_choice function = %#v", got.ToolChoice)
+		}
+	})
 }
 
 func TestOpenAIResponseToGemini(t *testing.T) {
@@ -451,5 +405,68 @@ func TestOpenAIStreamChunkToGeminiWithToolCalls(t *testing.T) {
 	functionCall := got.Candidates[0].Content.Parts[0].FunctionCall
 	if functionCall == nil || functionCall.Name != "lookup_weather" || functionCall.ID != "call_123" {
 		t.Fatalf("function call delta = %#v", got.Candidates[0].Content.Parts[0])
+	}
+}
+
+func assertGeminiReqMessages(t *testing.T, got openaip.ChatCompletionRequest) {
+	t.Helper()
+	if len(got.Messages) != 2 {
+		t.Fatalf("message count = %d, want 2", len(got.Messages))
+	}
+	if got.Messages[0].Role != "system" || got.Messages[0].Content != "Return JSON only." {
+		t.Fatalf("system message = %#v", got.Messages[0])
+	}
+
+	userParts, ok := got.Messages[1].Content.([]openaip.ContentPart)
+	if !ok {
+		t.Fatalf("user content type = %T, want []ContentPart", got.Messages[1].Content)
+	}
+	if len(userParts) != 4 {
+		t.Fatalf("user content parts = %d, want 4", len(userParts))
+	}
+	if userParts[0].Type != "text" || userParts[0].Text != "Describe this document" {
+		t.Fatalf("first part = %#v", userParts[0])
+	}
+	if userParts[1].Type != "image_url" || userParts[1].ImageURL == nil || userParts[1].ImageURL.URL == "" {
+		t.Fatalf("second part = %#v", userParts[1])
+	}
+	if userParts[2].ImageURL == nil || userParts[3].ImageURL == nil {
+		t.Fatalf("pdf parts missing image URLs: %#v", userParts)
+	}
+}
+
+func assertGeminiReqToolMessages(t *testing.T, got openaip.ChatCompletionRequest) {
+	t.Helper()
+	if len(got.Messages) != 3 {
+		t.Fatalf("message count = %d, want 3", len(got.Messages))
+	}
+
+	userParts, ok := got.Messages[0].Content.([]openaip.ContentPart)
+	if !ok || len(userParts) != 2 {
+		t.Fatalf("user content = %#v, want text+image parts", got.Messages[0].Content)
+	}
+	if userParts[1].ImageURL == nil || userParts[1].ImageURL.URL == "" {
+		t.Fatalf("translated fileData part = %#v", userParts[1])
+	}
+
+	if got.Messages[1].Role != "assistant" || len(got.Messages[1].ToolCalls) != 1 {
+		t.Fatalf("assistant tool call message = %#v", got.Messages[1])
+	}
+	if got.Messages[1].ToolCalls[0].Function == nil || got.Messages[1].ToolCalls[0].Function.Name != "lookup_weather" {
+		t.Fatalf("assistant tool call = %#v", got.Messages[1].ToolCalls[0])
+	}
+
+	if got.Messages[2].Role != "tool" || got.Messages[2].ToolCallID != "call_lookup" {
+		t.Fatalf("tool message = %#v", got.Messages[2])
+	}
+}
+
+func requirePtrEqual[T comparable](t *testing.T, name string, got *T, want T) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("%s is nil, want %v", name, want)
+	}
+	if *got != want {
+		t.Fatalf("%s = %v, want %v", name, *got, want)
 	}
 }

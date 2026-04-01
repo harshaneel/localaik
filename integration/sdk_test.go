@@ -101,47 +101,38 @@ func TestSDKGenAIGenerateContent(t *testing.T) {
 		t.Fatalf("GenerateContent returned error: %v", err)
 	}
 
-	if got := resp.Text(); got != `{"answer":"done"}` {
-		t.Fatalf("response text = %q, want JSON string", got)
-	}
-	if resp.UsageMetadata == nil || resp.UsageMetadata.TotalTokenCount != 16 {
-		t.Fatalf("usage metadata = %#v", resp.UsageMetadata)
-	}
+	t.Run("response", func(t *testing.T) {
+		if got := resp.Text(); got != `{"answer":"done"}` {
+			t.Fatalf("response text = %q, want JSON string", got)
+		}
+		if resp.UsageMetadata == nil || resp.UsageMetadata.TotalTokenCount != 16 {
+			t.Fatalf("usage metadata = %#v", resp.UsageMetadata)
+		}
+	})
 
-	if sdkRequest.Path != "/v1beta/models/gemini-test:generateContent" {
-		t.Fatalf("sdk request path = %q, want /v1beta/models/gemini-test:generateContent", sdkRequest.Path)
-	}
-	if sdkRequest.Headers.Get("X-Goog-Api-Key") != "test" {
-		t.Fatalf("sdk request x-goog-api-key = %q, want test", sdkRequest.Headers.Get("X-Goog-Api-Key"))
-	}
+	t.Run("sdk request", func(t *testing.T) {
+		if sdkRequest.Path != "/v1beta/models/gemini-test:generateContent" {
+			t.Fatalf("sdk request path = %q, want /v1beta/models/gemini-test:generateContent", sdkRequest.Path)
+		}
+		if sdkRequest.Headers.Get("X-Goog-Api-Key") != "test" {
+			t.Fatalf("sdk request x-goog-api-key = %q, want test", sdkRequest.Headers.Get("X-Goog-Api-Key"))
+		}
 
-	sdkBody := sdkRequest.mustJSONMap(t)
-	if _, ok := sdkBody["systemInstruction"]; !ok {
-		t.Fatalf("sdk request body missing systemInstruction: %#v", sdkBody)
-	}
-	if _, ok := sdkBody["generationConfig"]; !ok {
-		t.Fatalf("sdk request body missing generationConfig: %#v", sdkBody)
-	}
-	if _, ok := sdkBody["contents"]; !ok {
-		t.Fatalf("sdk request body missing contents: %#v", sdkBody)
-	}
+		sdkBody := sdkRequest.mustJSONMap(t)
+		if _, ok := sdkBody["systemInstruction"]; !ok {
+			t.Fatalf("sdk request body missing systemInstruction: %#v", sdkBody)
+		}
+		if _, ok := sdkBody["generationConfig"]; !ok {
+			t.Fatalf("sdk request body missing generationConfig: %#v", sdkBody)
+		}
+		if _, ok := sdkBody["contents"]; !ok {
+			t.Fatalf("sdk request body missing contents: %#v", sdkBody)
+		}
+	})
 
-	if upstreamRequest.Path != "/v1/chat/completions" {
-		t.Fatalf("upstream path = %q, want /v1/chat/completions", upstreamRequest.Path)
-	}
-	if upstreamRequest.Headers.Get("X-Goog-Api-Key") != "" {
-		t.Fatalf("x-goog-api-key leaked upstream: %q", upstreamRequest.Headers.Get("X-Goog-Api-Key"))
-	}
-
-	upstreamBody := upstreamRequest.mustJSONMap(t)
-	messages, ok := upstreamBody["messages"].([]any)
-	if !ok || len(messages) != 2 {
-		t.Fatalf("upstream messages = %#v", upstreamBody["messages"])
-	}
-	responseFormat, ok := upstreamBody["response_format"].(map[string]any)
-	if !ok || responseFormat["type"] != "json_schema" {
-		t.Fatalf("response format = %#v", upstreamBody["response_format"])
-	}
+	t.Run("upstream request", func(t *testing.T) {
+		assertGenAIUpstreamRequest(t, upstreamRequest)
+	})
 }
 
 func TestSDKGenAIStreamGenerateContent(t *testing.T) {
@@ -318,49 +309,30 @@ func TestSDKGenAIGenerateContentWithFilesAndTools(t *testing.T) {
 		t.Fatalf("GenerateContent returned error: %v", err)
 	}
 
-	if len(resp.Candidates) != 1 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) != 1 {
-		t.Fatalf("response candidates = %#v", resp.Candidates)
-	}
-	functionCall := resp.Candidates[0].Content.Parts[0].FunctionCall
-	if functionCall == nil || functionCall.Name != "lookup_weather" || functionCall.ID != "call_123" {
-		t.Fatalf("response function call = %#v", resp.Candidates[0].Content.Parts[0])
-	}
-	if functionCall.Args["city"] != "Boston" {
-		t.Fatalf("response function args = %#v", functionCall.Args)
-	}
-
 	upstreamBody := upstreamRequest.mustJSONMap(t)
-	gotTopP, ok := upstreamBody["top_p"].(float64)
-	if !ok || math.Abs(gotTopP-0.9) > 1e-6 {
-		t.Fatalf("upstream top_p = %#v, want about 0.9", upstreamBody["top_p"])
-	}
-	if upstreamBody["top_k"] != float64(40) {
-		t.Fatalf("upstream top_k = %#v, want 40", upstreamBody["top_k"])
-	}
-	if upstreamBody["n"] != float64(2) {
-		t.Fatalf("upstream n = %#v, want 2", upstreamBody["n"])
-	}
-	if upstreamBody["seed"] != float64(9) {
-		t.Fatalf("upstream seed = %#v, want 9", upstreamBody["seed"])
-	}
-	if upstreamBody["logprobs"] != true {
-		t.Fatalf("upstream logprobs = %#v, want true", upstreamBody["logprobs"])
-	}
-	if upstreamBody["top_logprobs"] != float64(2) {
-		t.Fatalf("upstream top_logprobs = %#v, want 2", upstreamBody["top_logprobs"])
-	}
-	tools, ok := upstreamBody["tools"].([]any)
-	if !ok || len(tools) != 1 {
-		t.Fatalf("upstream tools = %#v", upstreamBody["tools"])
-	}
-	toolChoice, ok := upstreamBody["tool_choice"].(map[string]any)
-	if !ok {
-		t.Fatalf("upstream tool_choice = %#v", upstreamBody["tool_choice"])
-	}
-	function, ok := toolChoice["function"].(map[string]any)
-	if !ok || function["name"] != "lookup_weather" {
-		t.Fatalf("upstream tool_choice function = %#v", upstreamBody["tool_choice"])
-	}
+
+	t.Run("response", func(t *testing.T) {
+		assertToolCallResponse(t, resp)
+	})
+
+	t.Run("upstream config", func(t *testing.T) {
+		assertToolsUpstreamConfig(t, upstreamBody)
+	})
+
+	t.Run("upstream tools", func(t *testing.T) {
+		tools, ok := upstreamBody["tools"].([]any)
+		if !ok || len(tools) != 1 {
+			t.Fatalf("upstream tools = %#v", upstreamBody["tools"])
+		}
+		toolChoice, ok := upstreamBody["tool_choice"].(map[string]any)
+		if !ok {
+			t.Fatalf("upstream tool_choice = %#v", upstreamBody["tool_choice"])
+		}
+		function, ok := toolChoice["function"].(map[string]any)
+		if !ok || function["name"] != "lookup_weather" {
+			t.Fatalf("upstream tool_choice function = %#v", upstreamBody["tool_choice"])
+		}
+	})
 }
 
 func TestSDKOpenAIChatCompletions(t *testing.T) {
@@ -402,6 +374,63 @@ func TestSDKOpenAIChatCompletions(t *testing.T) {
 	}
 	if upstreamRequest.Headers.Get("Authorization") != "" {
 		t.Fatalf("authorization leaked upstream: %q", upstreamRequest.Headers.Get("Authorization"))
+	}
+}
+
+func assertGenAIUpstreamRequest(t *testing.T, upstreamRequest capturedRequest) {
+	t.Helper()
+	if upstreamRequest.Path != "/v1/chat/completions" {
+		t.Fatalf("upstream path = %q, want /v1/chat/completions", upstreamRequest.Path)
+	}
+	if upstreamRequest.Headers.Get("X-Goog-Api-Key") != "" {
+		t.Fatalf("x-goog-api-key leaked upstream: %q", upstreamRequest.Headers.Get("X-Goog-Api-Key"))
+	}
+
+	upstreamBody := upstreamRequest.mustJSONMap(t)
+	messages, ok := upstreamBody["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("upstream messages = %#v", upstreamBody["messages"])
+	}
+	responseFormat, ok := upstreamBody["response_format"].(map[string]any)
+	if !ok || responseFormat["type"] != "json_schema" {
+		t.Fatalf("response format = %#v", upstreamBody["response_format"])
+	}
+}
+
+func assertToolCallResponse(t *testing.T, resp *genaisdk.GenerateContentResponse) {
+	t.Helper()
+	if len(resp.Candidates) != 1 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) != 1 {
+		t.Fatalf("response candidates = %#v", resp.Candidates)
+	}
+	functionCall := resp.Candidates[0].Content.Parts[0].FunctionCall
+	if functionCall == nil || functionCall.Name != "lookup_weather" || functionCall.ID != "call_123" {
+		t.Fatalf("response function call = %#v", resp.Candidates[0].Content.Parts[0])
+	}
+	if functionCall.Args["city"] != "Boston" {
+		t.Fatalf("response function args = %#v", functionCall.Args)
+	}
+}
+
+func assertToolsUpstreamConfig(t *testing.T, upstreamBody map[string]any) {
+	t.Helper()
+	gotTopP, ok := upstreamBody["top_p"].(float64)
+	if !ok || math.Abs(gotTopP-0.9) > 1e-6 {
+		t.Fatalf("upstream top_p = %#v, want about 0.9", upstreamBody["top_p"])
+	}
+	if upstreamBody["top_k"] != float64(40) {
+		t.Fatalf("upstream top_k = %#v, want 40", upstreamBody["top_k"])
+	}
+	if upstreamBody["n"] != float64(2) {
+		t.Fatalf("upstream n = %#v, want 2", upstreamBody["n"])
+	}
+	if upstreamBody["seed"] != float64(9) {
+		t.Fatalf("upstream seed = %#v, want 9", upstreamBody["seed"])
+	}
+	if upstreamBody["logprobs"] != true {
+		t.Fatalf("upstream logprobs = %#v, want true", upstreamBody["logprobs"])
+	}
+	if upstreamBody["top_logprobs"] != float64(2) {
+		t.Fatalf("upstream top_logprobs = %#v, want 2", upstreamBody["top_logprobs"])
 	}
 }
 
