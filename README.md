@@ -53,6 +53,8 @@ services:
 
 localaik is a plain HTTP server, so any language or SDK that can set a base URL will work.
 
+More runnable samples (curl, Go, Python, JavaScript, Java) live under **[examples/](examples/README.md)**.
+
 ### Gemini SDK
 
 **Go:**
