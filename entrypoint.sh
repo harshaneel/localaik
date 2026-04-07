@@ -18,12 +18,25 @@ if [ ! -x "${LLAMA_SERVER_BIN}" ]; then
   fi
 fi
 
-"${LLAMA_SERVER_BIN}" \
-  --model /models/model.gguf \
-  --mmproj /models/mmproj-model-f16.gguf \
-  --port 8080 \
-  --host 127.0.0.1 \
-  --ctx-size 8192 &
+SERVER_ARGS="--model /models/model.gguf"
+SERVER_ARGS="${SERVER_ARGS} --mmproj /models/mmproj-model-f16.gguf"
+SERVER_ARGS="${SERVER_ARGS} --port 8080"
+SERVER_ARGS="${SERVER_ARGS} --host 127.0.0.1"
+SERVER_ARGS="${SERVER_ARGS} --ctx-size ${LK_CTX_SIZE:-8192}"
+
+[ -n "${LK_THREADS:-}" ]       && SERVER_ARGS="${SERVER_ARGS} --threads ${LK_THREADS}"
+[ -n "${LK_THREADS_BATCH:-}" ] && SERVER_ARGS="${SERVER_ARGS} --threads-batch ${LK_THREADS_BATCH}"
+[ -n "${LK_BATCH_SIZE:-}" ]    && SERVER_ARGS="${SERVER_ARGS} --batch-size ${LK_BATCH_SIZE}"
+[ -n "${LK_UBATCH_SIZE:-}" ]   && SERVER_ARGS="${SERVER_ARGS} --ubatch-size ${LK_UBATCH_SIZE}"
+[ -n "${LK_GPU_LAYERS:-}" ]    && SERVER_ARGS="${SERVER_ARGS} --n-gpu-layers ${LK_GPU_LAYERS}"
+[ -n "${LK_PARALLEL:-}" ]      && SERVER_ARGS="${SERVER_ARGS} --parallel ${LK_PARALLEL}"
+
+[ "${LK_FLASH_ATTN:-0}" = "1" ]    && SERVER_ARGS="${SERVER_ARGS} --flash-attn"
+[ "${LK_CONT_BATCHING:-0}" = "1" ] && SERVER_ARGS="${SERVER_ARGS} --cont-batching"
+[ "${LK_MLOCK:-0}" = "1" ]         && SERVER_ARGS="${SERVER_ARGS} --mlock"
+
+# shellcheck disable=SC2086
+"${LLAMA_SERVER_BIN}" ${SERVER_ARGS} &
 
 echo "localaik: loading model..."
 tries=0
