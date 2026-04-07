@@ -1,11 +1,11 @@
 # localaik
 
-[CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
-[Docker Hub](https://hub.docker.com/r/gokhalh/localaik)
-[License: MIT](LICENSE)
-[Go Report Card](https://goreportcard.com/report/github.com/harshaneel/localaik)
-[Go Version](https://github.com/harshaneel/localaik/blob/main/go.mod)
-[Go Reference](https://pkg.go.dev/github.com/harshaneel/localaik)
+[![CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml/badge.svg)](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
+[![Docker Hub](https://img.shields.io/docker/v/gokhalh/localaik?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/gokhalh/localaik)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/harshaneel/localaik)](https://goreportcard.com/report/github.com/harshaneel/localaik)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/harshaneel/localaik)](https://github.com/harshaneel/localaik/blob/main/go.mod)
+[![Go Reference](https://pkg.go.dev/badge/github.com/harshaneel/localaik.svg)](https://pkg.go.dev/github.com/harshaneel/localaik)
 
 A local compatibility server for the Gemini and OpenAI APIs. Run one container, point your SDK at `http://localhost:8090`, and get both protocol shapes on the same port for tests and development.
 
