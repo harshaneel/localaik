@@ -1,11 +1,11 @@
 # localaik
 
-[![CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml/badge.svg)](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
-[![Docker Hub](https://img.shields.io/docker/v/gokhalh/localaik?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/gokhalh/localaik)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/harshaneel/localaik)](https://goreportcard.com/report/github.com/harshaneel/localaik)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/harshaneel/localaik)](https://github.com/harshaneel/localaik/blob/main/go.mod)
-[![Go Reference](https://pkg.go.dev/badge/github.com/harshaneel/localaik.svg)](https://pkg.go.dev/github.com/harshaneel/localaik)
+[CI](https://github.com/harshaneel/localaik/actions/workflows/release.yml)
+[Docker Hub](https://hub.docker.com/r/gokhalh/localaik)
+[License: MIT](LICENSE)
+[Go Report Card](https://goreportcard.com/report/github.com/harshaneel/localaik)
+[Go Version](https://github.com/harshaneel/localaik/blob/main/go.mod)
+[Go Reference](https://pkg.go.dev/github.com/harshaneel/localaik)
 
 A local compatibility server for the Gemini and OpenAI APIs. Run one container, point your SDK at `http://localhost:8090`, and get both protocol shapes on the same port for tests and development.
 
@@ -58,6 +58,7 @@ More runnable samples (curl, Go, Python, JavaScript, Java) live under **[example
 ### Gemini SDK
 
 **Go:**
+
 ```go
 client, err := genai.NewClient(ctx, &genai.ClientConfig{
     APIKey:      "test",
@@ -66,6 +67,7 @@ client, err := genai.NewClient(ctx, &genai.ClientConfig{
 ```
 
 **Python:**
+
 ```python
 from google import genai
 
@@ -84,6 +86,7 @@ export GOOGLE_GEMINI_BASE_URL=http://localhost:8090
 ### OpenAI SDK
 
 **Python:**
+
 ```python
 from openai import OpenAI
 
@@ -91,6 +94,7 @@ client = OpenAI(api_key="test", base_url="http://localhost:8090/v1")
 ```
 
 **Go:**
+
 ```go
 client := openai.NewClient(
     option.WithAPIKey("test"),
@@ -108,6 +112,51 @@ client := openai.NewClient(
 
 
 Version-pinned tags follow the pattern `v0.1.1-gemma3-4b`, `v0.1.1-gemma3-12b`.
+
+## Tuning (v0.1.3 onwards)
+
+Pass environment variables to tune the underlying model server:
+
+```bash
+docker run -d -p 8090:8090 \
+  -e LK_THREADS=8 \
+  -e LK_CTX_SIZE=4096 \
+  -e LK_FLASH_ATTN=1 \
+  -e LK_CONT_BATCHING=1 \
+  -e LK_PARALLEL=2 \
+  gokhalh/localaik
+```
+
+Or with Docker Compose:
+
+```yaml
+services:
+  localaik:
+    image: gokhalh/localaik
+    ports:
+      - "8090:8090"
+    environment:
+      LK_THREADS: 8
+      LK_CTX_SIZE: 4096
+      LK_FLASH_ATTN: 1
+      LK_CONT_BATCHING: 1
+      LK_PARALLEL: 2
+```
+
+
+| Variable           | Default         | Description                         |
+| ------------------ | --------------- | ----------------------------------- |
+| `LK_CTX_SIZE`      | 8192            | Context window in tokens            |
+| `LK_THREADS`       | auto            | CPU threads for inference           |
+| `LK_THREADS_BATCH` | same as threads | CPU threads for prompt processing   |
+| `LK_BATCH_SIZE`    | 2048            | Prompt processing batch size        |
+| `LK_UBATCH_SIZE`   | 512             | Micro-batch size                    |
+| `LK_GPU_LAYERS`    | 0               | Layers offloaded to GPU (99 = all)  |
+| `LK_PARALLEL`      | 1               | Max concurrent request slots        |
+| `LK_FLASH_ATTN`    | 0 (off)         | Flash attention (`1` to enable)     |
+| `LK_CONT_BATCHING` | 0 (off)         | Continuous batching (`1` to enable) |
+| `LK_MLOCK`         | 0 (off)         | Lock model in RAM (`1` to enable)   |
+
 
 ## Implemented routes
 
