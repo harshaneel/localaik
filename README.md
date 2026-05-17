@@ -175,8 +175,8 @@ All other API routes return `404`.
 
 Automated contract tests validate against:
 
-- `google.golang.org/genai` v1.51.0
-- `github.com/openai/openai-go/v3` v3.30.0
+- `google.golang.org/genai` v1.57.0
+- `github.com/openai/openai-go/v3` v3.36.0
 
 Other SDK versions and languages may work if they emit the same HTTP shapes.
 
