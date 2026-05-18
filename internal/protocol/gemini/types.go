@@ -133,6 +133,29 @@ type UsageMetadata struct {
 	TotalTokenCount      int `json:"totalTokenCount,omitempty"`
 }
 
+type Model struct {
+	Name                       string   `json:"name,omitempty"`
+	DisplayName                string   `json:"displayName,omitempty"`
+	Description                string   `json:"description,omitempty"`
+	Version                    string   `json:"version,omitempty"`
+	InputTokenLimit            int      `json:"inputTokenLimit,omitempty"`
+	OutputTokenLimit           int      `json:"outputTokenLimit,omitempty"`
+	SupportedGenerationMethods []string `json:"supportedGenerationMethods,omitempty"`
+}
+
+type ListModelsResponse struct {
+	Models        []Model `json:"models"`
+	NextPageToken string  `json:"nextPageToken,omitempty"`
+}
+
+type CountTokensRequest struct {
+	Contents []Content `json:"contents,omitempty"`
+}
+
+type CountTokensResponse struct {
+	TotalTokens int `json:"totalTokens"`
+}
+
 type ErrorResponse struct {
 	Error Error `json:"error"`
 }

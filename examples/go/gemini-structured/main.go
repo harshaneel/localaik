@@ -32,8 +32,8 @@ func main() {
 				Items: &genai.Schema{
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
-						"name": {Type: genai.TypeString},
-						"year": {Type: genai.TypeInteger},
+						"name":     {Type: genai.TypeString},
+						"year":     {Type: genai.TypeInteger},
 						"use_case": {Type: genai.TypeString},
 					},
 					Required: []string{"name", "year", "use_case"},

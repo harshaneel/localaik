@@ -21,10 +21,13 @@ type Config struct {
 }
 
 type Server struct {
-	client            *http.Client
-	pdfRenderer       pdf.Renderer
-	upstreamChatURL   string
-	upstreamHealthURL string
+	client              *http.Client
+	pdfRenderer         pdf.Renderer
+	upstreamChatURL     string
+	upstreamCompletions string
+	upstreamModelsURL   string
+	upstreamTokenizeURL string
+	upstreamHealthURL   string
 }
 
 func New(cfg Config) (*Server, error) {
@@ -51,10 +54,13 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		client:            client,
-		pdfRenderer:       renderer,
-		upstreamChatURL:   resolveURLPath(parsed, "chat/completions"),
-		upstreamHealthURL: deriveHealthURL(parsed),
+		client:              client,
+		pdfRenderer:         renderer,
+		upstreamChatURL:     resolveURLPath(parsed, "chat/completions"),
+		upstreamCompletions: resolveURLPath(parsed, "completions"),
+		upstreamModelsURL:   resolveURLPath(parsed, "models"),
+		upstreamTokenizeURL: deriveRootURL(parsed, "tokenize"),
+		upstreamHealthURL:   deriveRootURL(parsed, "health"),
 	}, nil
 }
 
@@ -63,11 +69,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		s.handleHealth(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
-		s.handleOpenAIChatCompletions(w, r)
+		s.handleOpenAIPassthrough(w, r, s.upstreamChatURL)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/completions":
+		s.handleOpenAIPassthrough(w, r, s.upstreamCompletions)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+		s.handleOpenAIModelsList(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/models/"):
+		s.handleOpenAIModelGet(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1beta/models":
+		s.handleGeminiModelsList(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1beta/models/") && strings.HasSuffix(r.URL.Path, ":generateContent"):
 		s.handleGeminiGenerateContent(w, r, false)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1beta/models/") && strings.HasSuffix(r.URL.Path, ":streamGenerateContent"):
 		s.handleGeminiGenerateContent(w, r, true)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1beta/models/") && strings.HasSuffix(r.URL.Path, ":countTokens"):
+		s.handleGeminiCountTokens(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1beta/models/"):
+		s.handleGeminiModelGet(w, r)
 	default:
 		s.handleNotFound(w, r)
 	}
@@ -113,11 +131,11 @@ func resolveURLPath(base *url.URL, extra string) string {
 	return clone.String()
 }
 
-func deriveHealthURL(base *url.URL) string {
+func deriveRootURL(base *url.URL, extra string) string {
 	clone := *base
 	basePath := strings.TrimSuffix(clone.Path, "/")
 	basePath = strings.TrimSuffix(basePath, "/v1")
-	clone.Path = joinURLPath(basePath, "health")
+	clone.Path = joinURLPath(basePath, extra)
 	return clone.String()
 }
 

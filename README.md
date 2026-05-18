@@ -165,7 +165,13 @@ services:
 | --------------------------------------------------- | ------------------------------ | --------------------------------------- |
 | `POST /v1beta/models/{model}:generateContent`       | Gemini `GenerateContent`       | Translated to upstream chat completions |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Gemini `GenerateContentStream` | Gemini-style SSE (typically `?alt=sse`) |
+| `POST /v1beta/models/{model}:countTokens`           | Gemini `CountTokens`           | Translated to upstream `/tokenize`      |
+| `GET /v1beta/models`                                | Gemini `Models.List`           | Translated from upstream `/v1/models`   |
+| `GET /v1beta/models/{model}`                        | Gemini `Models.Get`            | Translated from upstream `/v1/models`   |
 | `POST /v1/chat/completions`                         | OpenAI chat completions        | Forwarded to upstream                   |
+| `POST /v1/completions`                              | OpenAI legacy completions      | Forwarded to upstream                   |
+| `GET /v1/models`                                    | OpenAI `Models.List`           | Forwarded to upstream                   |
+| `GET /v1/models/{model}`                            | OpenAI `Models.Retrieve`       | Forwarded to upstream                   |
 | `GET /health`                                       | Health checks                  | Custom route                            |
 
 
@@ -227,13 +233,14 @@ jobs:
 
 **Not supported:**
 
-- SDK methods outside `GenerateContent` / `GenerateContentStream`
+- SDK methods outside `GenerateContent` / `GenerateContentStream` / `CountTokens` / `Models.List` / `Models.Get`
 - Non-function tools (Google Search, Maps, URL context, code execution)
-- Embeddings, token counting, cached content, live/bidi sessions, uploads
+- Embeddings, cached content, live/bidi sessions, uploads
+- `ComputeTokens` is Vertex-only in the SDK and not exposed on `BackendGeminiAPI`
 
 ## OpenAI compatibility
 
-**Supported:** text chat completions, structured output, vision inputs, tool-related fields (all passed through to upstream).
+**Supported:** text chat completions, legacy `/v1/completions`, `Models.List` / `Models.Retrieve`, structured output, vision inputs, tool-related fields (all passed through to upstream).
 
 **Not supported:** Responses API, Assistants, Embeddings, Images, Audio, Files, Vector stores.
 
