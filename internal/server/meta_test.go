@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -238,6 +239,7 @@ func TestServerMethodConfusion(t *testing.T) {
 	}{
 		{http.MethodPost, "/v1/models"},
 		{http.MethodPost, "/v1/models/gemma-3-4b"},
+		{http.MethodPost, "/v1beta/models"},
 		{http.MethodPut, "/v1beta/models"},
 		{http.MethodPut, "/v1beta/models/gemma-3-4b"},
 		{http.MethodGet, "/v1/chat/completions"},
@@ -308,15 +310,6 @@ func TestServerGeminiCountTokensUpstreamError(t *testing.T) {
 }
 
 func TestServerPassthroughStripsAuthHeaders(t *testing.T) {
-	var seenAuth, seenGoogKey string
-
-	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenAuth = r.Header.Get("Authorization")
-		seenGoogKey = r.Header.Get("X-Goog-Api-Key")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	})
-
 	cases := []struct {
 		name   string
 		method string
@@ -328,10 +321,20 @@ func TestServerPassthroughStripsAuthHeaders(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			seenAuth, seenGoogKey = "", ""
+			var seenAuth, seenGoogKey string
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenAuth = r.Header.Get("Authorization")
+				seenGoogKey = r.Header.Get("X-Goog-Api-Key")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{}`))
+			})
 			srv := newTestServer(t, upstream)
 
-			req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(`{}`))
+			var body io.Reader
+			if tc.method == http.MethodPost {
+				body = bytes.NewBufferString(`{}`)
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
 			req.Header.Set("Authorization", "Bearer secret")
 			req.Header.Set("X-Goog-Api-Key", "secret-key")
 			rec := httptest.NewRecorder()
