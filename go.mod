@@ -3,8 +3,8 @@ module github.com/harshaneel/localaik
 go 1.25
 
 require (
-	github.com/openai/openai-go/v3 v3.30.0
-	google.golang.org/genai v1.51.0
+	github.com/openai/openai-go/v3 v3.36.0
+	google.golang.org/genai v1.57.0
 )
 
 require (
