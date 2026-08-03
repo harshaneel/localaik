@@ -533,6 +533,9 @@ func collectToolBlocks(t *testing.T, events []sseEvent) []toolBlock {
 				if !strings.Contains(event.data, `"name"`) {
 					t.Fatalf("tool_use content_block_start has no name field: %s", event.data)
 				}
+				if decoded.ContentBlock.Name == "" {
+					t.Fatalf("tool_use content_block_start has an empty name, which no client can invoke: %s", event.data)
+				}
 				slots[index] = len(blocks)
 				blocks = append(blocks, toolBlock{
 					index: index,
@@ -732,6 +735,118 @@ func TestWriteAnthropicStreamTrailingToolCallDeltas(t *testing.T) {
 	}
 }
 
+// Upstreams repeat finished tool calls, whether as a padding delta or by resending
+// the whole tool_calls array in a later chunk. Once a call has been emitted, such a
+// delta must be recognised as an echo: treating it as a new call makes the client
+// invoke a real tool with empty arguments.
+func TestWriteAnthropicStreamEchoesOfFlushedToolCalls(t *testing.T) {
+	firstCall := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`
+	secondCall := `data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`
+
+	cases := []struct {
+		name     string
+		upstream []string
+		want     []toolBlock
+	}{
+		{
+			// The whole array is resent after both calls are done.
+			name: "resent_tool_calls_array",
+			upstream: []string{
+				firstCall,
+				secondCall,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":""}},{"index":1,"id":"c1","type":"function","function":{"name":"second","arguments":""}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "first", input: `{"a":1}`},
+				{id: "c1", name: "second", input: `{"b":2}`},
+			},
+		},
+		{
+			// An anonymous padding delta for a call already closed by a higher index.
+			name: "anonymous_padding_after_higher_index",
+			upstream: []string{
+				firstCall,
+				secondCall,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "first", input: `{"a":1}`},
+				{id: "c1", name: "second", input: `{"b":2}`},
+			},
+		},
+		{
+			// A trailing delta after text closed the call.
+			name: "padding_after_text",
+			upstream: []string{
+				firstCall,
+				`data: {"choices":[{"delta":{"content":"done"}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":""}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "first", input: `{"a":1}`},
+			},
+		},
+		{
+			// A delta at a flushed index that brings a genuinely different id is a new
+			// call, not an echo, and must still be emitted. Blocks are ordered by
+			// upstream index, so revisiting index 0 while index 1 is open places the
+			// new call before it.
+			name: "different_id_is_not_an_echo",
+			upstream: []string{
+				firstCall,
+				secondCall,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c9","type":"function","function":{"name":"third","arguments":"{\"c\":3}"}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "first", input: `{"a":1}`},
+				{id: "c9", name: "third", input: `{"c":3}`},
+				{id: "c1", name: "second", input: `{"b":2}`},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := strings.Join(append(tc.upstream, `data: [DONE]`, ``), "\n\n")
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+			if len(blocks) != len(tc.want) {
+				t.Fatalf("emitted %d tool blocks, want %d: %#v", len(blocks), len(tc.want), blocks)
+			}
+			for i, want := range tc.want {
+				if blocks[i].id != want.id || blocks[i].name != want.name || blocks[i].input != want.input {
+					t.Fatalf("block %d = %#v, want id %q name %q input %q", i, blocks[i], want.id, want.name, want.input)
+				}
+			}
+		})
+	}
+}
+
+// Two argument-less calls at one index are separable when they carry different
+// ids. Concatenating their names would invent a tool that does not exist.
+func TestWriteAnthropicStreamArgumentlessCallsWithDifferentIDs(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"alpha"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"beta"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+	if len(blocks) != 2 {
+		t.Fatalf("emitted %d tool blocks, want 2: %#v", len(blocks), blocks)
+	}
+	for i, want := range []toolBlock{{id: "c0", name: "alpha"}, {id: "c1", name: "beta"}} {
+		if blocks[i].id != want.id || blocks[i].name != want.name {
+			t.Fatalf("block %d = %#v, want id %q name %q", i, blocks[i], want.id, want.name)
+		}
+	}
+}
+
 // Two parallel calls to the same tool with no upstream ids must not share an id:
 // the client's tool_result blocks key on it.
 func TestWriteAnthropicStreamDeduplicatesSynthesizedToolIDs(t *testing.T) {
@@ -821,16 +936,15 @@ func TestWriteAnthropicStreamDistinctCallsAtSameIndex(t *testing.T) {
 			},
 		},
 		{
-			// Nothing to derive an id from, so the synthesized ids must still differ.
-			name: "no_identity_at_all",
+			// Upstream named neither call. A tool_use with no name cannot be invoked
+			// and the real API never emits one, so both are dropped rather than sent
+			// as blocks the client cannot act on.
+			name: "no_identity_at_all_is_dropped",
 			upstream: []string{
 				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1}"}}]}}]}`,
 				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"y\":2}"}}]}}]}`,
 			},
-			want: []toolBlock{
-				{id: "toolu_localaik", name: "", input: `{"x":1}`},
-				{id: "toolu_localaik_2", name: "", input: `{"y":2}`},
-			},
+			want: nil,
 		},
 		{
 			name: "three_calls_one_index",
@@ -1344,6 +1458,16 @@ func TestWriteAnthropicStreamToolCallShapeMatrix(t *testing.T) {
 
 								if padding {
 									emit(i, `"function":{"arguments":""}`)
+								}
+							}
+
+							// Padding replayed once every call has been emitted, which lands at
+							// indices already flushed. This is the shape four review rounds of
+							// fixtures could not generate, because each emitted its padding
+							// before the next call started.
+							if padding {
+								for i, c := range calls {
+									emit(i, fmt.Sprintf(`"id":%q,"type":"function","function":{"name":%q,"arguments":""}`, c.id, c.name))
 								}
 							}
 

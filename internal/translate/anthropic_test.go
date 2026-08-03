@@ -216,6 +216,62 @@ func TestAnthropicRequestToOpenAIRejectsMissingMaxTokens(t *testing.T) {
 	}
 }
 
+func TestAnthropicRequestToOpenAIRejectsNonPositiveMaxTokens(t *testing.T) {
+	for _, maxTokens := range []string{"0", "-1"} {
+		t.Run("max_tokens="+maxTokens, func(t *testing.T) {
+			req := decodeAnthropicRequest(t, `{"max_tokens":`+maxTokens+`,"messages":[{"role":"user","content":"hi"}]}`)
+
+			_, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+			if err == nil {
+				t.Fatalf("expected an error for max_tokens %s", maxTokens)
+			}
+			if !strings.Contains(err.Error(), "max_tokens") {
+				t.Fatalf("error = %q, want it to name max_tokens", err)
+			}
+		})
+	}
+}
+
+// A tool_result answers the assistant message that requested it, so it must come
+// before any other content in the same turn. The SDK's tool-use loop emits a user
+// turn shaped exactly like this.
+func TestAnthropicRequestToOpenAIToolResultPrecedesFollowUpText(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 64,
+		"messages": [
+			{"role": "user", "content": "weather in Paris?"},
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "toolu_1", "content": "18C"},
+				{"type": "text", "text": "and tomorrow?"}
+			]}
+		]
+	}`)
+
+	got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+
+	var roles []string
+	for _, message := range got.Messages {
+		roles = append(roles, message.Role)
+	}
+	want := []string{"user", "assistant", "tool", "user"}
+	if !reflect.DeepEqual(roles, want) {
+		t.Fatalf("message roles = %v, want %v (the tool result must follow the assistant that asked for it)", roles, want)
+	}
+
+	if got.Messages[2].ToolCallID != "toolu_1" || got.Messages[2].Content != "18C" {
+		t.Fatalf("tool message = %#v", got.Messages[2])
+	}
+	if got.Messages[3].Content != "and tomorrow?" {
+		t.Fatalf("follow-up message = %#v", got.Messages[3])
+	}
+}
+
 func TestAnthropicRequestToOpenAIRejectsEmptyMessages(t *testing.T) {
 	req := decodeAnthropicRequest(t, `{"max_tokens":16,"messages":[]}`)
 
@@ -609,6 +665,109 @@ func TestOpenAIResponseToAnthropicToolCalls(t *testing.T) {
 	}
 	if got.Model != DefaultOpenAIModel {
 		t.Fatalf("model = %q, want the fallback model", got.Model)
+	}
+}
+
+// Some runtimes report finish_reason "stop" alongside tool calls. Agent loops
+// branch on stop_reason to decide whether to run tools, so a message carrying
+// tool_use has to say tool_use however upstream labelled it.
+func TestOpenAIResponseToAnthropicStopReasonWithToolCalls(t *testing.T) {
+	for _, finishReason := range []string{"stop", "", "length", "content_filter", "tool_calls"} {
+		t.Run("finish_reason="+finishReason, func(t *testing.T) {
+			resp := openaip.ChatCompletionResponse{
+				Choices: []openaip.Choice{{
+					Message: openaip.Message{
+						Content: "let me check",
+						ToolCalls: []openaip.ToolCall{{
+							ID:       "toolu_1",
+							Function: &openaip.ToolCallFunction{Name: "get_weather", Arguments: `{}`},
+						}},
+					},
+					FinishReason: finishReason,
+				}},
+			}
+
+			got := OpenAIResponseToAnthropic(resp, "")
+
+			if got.StopReason == nil {
+				t.Fatal("stop_reason is null on a message carrying tool_use")
+			}
+			if *got.StopReason != anthropic.StopReasonToolUse {
+				t.Fatalf("stop_reason = %q, want tool_use", *got.StopReason)
+			}
+		})
+	}
+}
+
+// An unnamed tool call cannot be invoked and the Messages API never emits one.
+func TestOpenAIResponseToAnthropicDropsUnnamedToolCalls(t *testing.T) {
+	resp := openaip.ChatCompletionResponse{
+		Choices: []openaip.Choice{{
+			Message: openaip.Message{
+				ToolCalls: []openaip.ToolCall{
+					{ID: "toolu_1", Function: &openaip.ToolCallFunction{Name: "", Arguments: `{"a":1}`}},
+					{ID: "toolu_2", Function: &openaip.ToolCallFunction{Name: "ok", Arguments: `{}`}},
+				},
+			},
+			FinishReason: "tool_calls",
+		}},
+	}
+
+	got := OpenAIResponseToAnthropic(resp, "")
+
+	if len(got.Content) != 1 || got.Content[0].Name != "ok" {
+		t.Fatalf("content = %#v, want only the named tool call", got.Content)
+	}
+}
+
+// Parallel calls to one tool from an upstream that sends no ids must not share an
+// id, and the disambiguating suffix must not itself collide with a real id.
+func TestOpenAIResponseToAnthropicToolUseIDsAreUnique(t *testing.T) {
+	cases := []struct {
+		name  string
+		calls []openaip.ToolCall
+	}{
+		{
+			name: "same_tool_twice_without_ids",
+			calls: []openaip.ToolCall{
+				{Function: &openaip.ToolCallFunction{Name: "read_file", Arguments: `{"p":"a.txt"}`}},
+				{Function: &openaip.ToolCallFunction{Name: "read_file", Arguments: `{"p":"b.txt"}`}},
+				{Function: &openaip.ToolCallFunction{Name: "read_file", Arguments: `{"p":"c.txt"}`}},
+			},
+		},
+		{
+			// A real id shaped like the suffix this would synthesize.
+			name: "real_id_collides_with_a_suffix",
+			calls: []openaip.ToolCall{
+				{ID: "toolu_f_2", Function: &openaip.ToolCallFunction{Name: "g", Arguments: `{}`}},
+				{Function: &openaip.ToolCallFunction{Name: "f", Arguments: `{}`}},
+				{Function: &openaip.ToolCallFunction{Name: "f", Arguments: `{}`}},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := openaip.ChatCompletionResponse{
+				Choices: []openaip.Choice{{Message: openaip.Message{ToolCalls: tc.calls}}},
+			}
+
+			got := OpenAIResponseToAnthropic(resp, "")
+
+			if len(got.Content) != len(tc.calls) {
+				t.Fatalf("content = %#v, want %d blocks", got.Content, len(tc.calls))
+			}
+			seen := map[string]bool{}
+			for _, block := range got.Content {
+				if block.ID == "" {
+					t.Fatalf("block %#v has no id", block)
+				}
+				if seen[block.ID] {
+					t.Fatalf("id %q used twice; content = %#v", block.ID, got.Content)
+				}
+				seen[block.ID] = true
+			}
+		})
 	}
 }
 

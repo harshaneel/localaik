@@ -23,6 +23,9 @@ func AnthropicRequestToOpenAI(ctx context.Context, req anthropic.MessagesRequest
 	if req.MaxTokens == nil {
 		return openaip.ChatCompletionRequest{}, fmt.Errorf("max_tokens: field required")
 	}
+	if *req.MaxTokens < 1 {
+		return openaip.ChatCompletionRequest{}, fmt.Errorf("max_tokens: input should be greater than or equal to 1")
+	}
 
 	result := openaip.ChatCompletionRequest{
 		Model:    DefaultOpenAIModel,
@@ -99,9 +102,17 @@ func OpenAIResponseToAnthropic(resp openaip.ChatCompletionResponse, model string
 				Text: text,
 			})
 		}
-		out.Content = append(out.Content, openAIToolCallsToAnthropicBlocks(choice.Message.ToolCalls)...)
+		toolBlocks := openAIToolCallsToAnthropicBlocks(choice.Message.ToolCalls)
+		out.Content = append(out.Content, toolBlocks...)
 
-		if reason := OpenAIFinishReasonToAnthropic(choice.FinishReason); reason != "" {
+		reason := OpenAIFinishReasonToAnthropic(choice.FinishReason)
+		// Some runtimes report finish_reason "stop" alongside tool calls. Agent
+		// loops branch on stop_reason to decide whether to run tools and reply with
+		// tool_result, so a message carrying tool_use has to say tool_use.
+		if len(toolBlocks) > 0 {
+			reason = anthropic.StopReasonToolUse
+		}
+		if reason != "" {
 			out.StopReason = &reason
 		}
 	}
@@ -438,6 +449,11 @@ func openAIToolCallsToAnthropicBlocks(calls []openaip.ToolCall) []anthropic.Cont
 		if call.Function == nil {
 			continue
 		}
+		// An unnamed tool call cannot be invoked, and the Messages API never emits
+		// one, so it is dropped rather than sent as a block no client can act on.
+		if call.Function.Name == "" {
+			continue
+		}
 		blocks = append(blocks, anthropic.ContentBlock{
 			Type:  anthropic.BlockTypeToolUse,
 			ID:    ids.assign(call.ID, call.Function.Name),
@@ -456,22 +472,25 @@ func openAIToolCallsToAnthropicBlocks(calls []openaip.ToolCall) []anthropic.Cont
 // which the real API rejects on the next turn, breaking an agent loop a turn
 // after the mistake was made.
 type toolUseIDs struct {
-	used map[string]int
+	used map[string]bool
 }
 
 func newToolUseIDs() *toolUseIDs {
-	return &toolUseIDs{used: make(map[string]int)}
+	return &toolUseIDs{used: make(map[string]bool)}
 }
 
 func (t *toolUseIDs) assign(id, name string) string {
-	candidate := anthropicToolUseID(id, name)
+	base := anthropicToolUseID(id, name)
 
-	seen := t.used[candidate]
-	t.used[candidate] = seen + 1
-	if seen == 0 {
-		return candidate
+	// Every id handed out is recorded, including a suffixed one, so a later
+	// candidate that happens to match a suffix already in use is disambiguated too.
+	candidate := base
+	for attempt := 2; t.used[candidate]; attempt++ {
+		candidate = fmt.Sprintf("%s_%d", base, attempt)
 	}
-	return fmt.Sprintf("%s_%d", candidate, seen+1)
+	t.used[candidate] = true
+
+	return candidate
 }
 
 // anthropicToolInput normalises OpenAI's stringified arguments into the JSON

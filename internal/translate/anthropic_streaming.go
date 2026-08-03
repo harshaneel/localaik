@@ -123,6 +123,7 @@ type anthropicStreamWriter struct {
 	nextIndex    int
 	textIndex    int
 	pendingTools map[int]*pendingToolCall
+	flushedTools map[int]flushedToolCall
 	toolUseIDs   *toolUseIDs
 	messageID    string
 	stopReason   string
@@ -151,18 +152,57 @@ func (p *pendingToolCall) midObject() bool {
 	return p.arguments != "" && !isJSONObject(p.arguments)
 }
 
-// startsFreshArguments reports whether a delta begins a new JSON object while this
-// call's arguments are already whole, which means upstream has moved on to another
-// call at the same index.
+// flushedToolCall remembers the identity of a call already emitted at an upstream
+// index, so a delta that merely restates it can be recognised as an echo rather
+// than mistaken for a new call.
+type flushedToolCall struct {
+	upstreamID string
+	name       string
+}
+
+// echoes reports whether a delta only restates this already-emitted call: it
+// brings no arguments, and no identity that contradicts what was emitted.
 //
-// Upstreams that omit `index` put every call at 0, so this is the only thing
-// separating two of them. It deliberately keys on the argument stream rather than
-// on the id or name: identity can arrive at any point in a call, so comparing it
-// mistakes late identity for a new call. And because a new object is required, a
-// trailing delta that carries no arguments — a padding delta, or identity arriving
-// after the arguments completed — reads as the continuation it is.
-func (p *pendingToolCall) startsFreshArguments(arguments string) bool {
-	if p.arguments == "" || p.midObject() {
+// Upstreams do repeat finished tool calls, whether as a padding delta with empty
+// arguments or by resending the whole tool_calls array in a later chunk. Treating
+// those as new calls fabricates a duplicate invocation, which is worse than
+// dropping them: the client would run a real tool with empty arguments.
+//
+// A delta that brings arguments, or a different id or name, is not an echo and
+// does start a new call. One that brings nothing at all is indistinguishable from
+// an echo, and is treated as one.
+func (f flushedToolCall) echoes(id, name, arguments string) bool {
+	if strings.TrimSpace(arguments) != "" {
+		return false
+	}
+	if id != "" && id != f.upstreamID {
+		return false
+	}
+	return name == "" || name == f.name
+}
+
+// startsNewCall reports whether a delta belongs to a different call than the one
+// pending at its index. Upstreams that omit `index` put every call at 0, so
+// without this two of them would merge and their arguments concatenate.
+//
+// Two signals, each valid only where it cannot be confused with a continuation:
+//
+//   - Arguments that begin a new JSON object while this call's arguments are
+//     already whole. Concatenating them could not produce valid JSON, so they
+//     must belong to different calls. Requiring a *new object* is what keeps a
+//     trailing delta carrying no arguments — a padding delta, or identity that
+//     arrives after the arguments completed — reading as the continuation it is.
+//   - A different id while no arguments have been seen at all. Once arguments are
+//     in flight an id may simply be arriving late, so it says nothing; before
+//     then, two different ids can only be two different calls.
+//
+// Names are deliberately not compared. A name can arrive in fragments, which is
+// indistinguishable from two calls to different tools when neither carries an id.
+func (p *pendingToolCall) startsNewCall(id, arguments string) bool {
+	if p.arguments == "" {
+		return id != "" && p.upstreamID != "" && id != p.upstreamID
+	}
+	if p.midObject() {
 		return false
 	}
 	return strings.HasPrefix(strings.TrimSpace(arguments), "{")
@@ -190,6 +230,7 @@ func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStr
 		model:        model,
 		textIndex:    -1,
 		pendingTools: make(map[int]*pendingToolCall),
+		flushedTools: make(map[int]flushedToolCall),
 		toolUseIDs:   newToolUseIDs(),
 	}
 }
@@ -315,13 +356,25 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 		arguments = call.Function.Arguments
 	}
 
+	name := ""
+	if call.Function != nil {
+		name = call.Function.Name
+	}
+
+	// A delta that only restates a call already emitted at this index is an echo,
+	// not a new call. Checked before any flushing, so an echo cannot end the calls
+	// below it either.
+	if flushed, ok := a.flushedTools[call.Index]; ok && flushed.echoes(call.ID, name, arguments) {
+		return
+	}
+
 	// Upstream moving to a higher index ends the lower calls, unless one is still
 	// mid-object: some upstreams start a later index and then come back to finish
 	// an earlier one.
 	a.flushSettledToolCallsBelow(call.Index)
 
 	pending, ok := a.pendingTools[call.Index]
-	if ok && pending.startsFreshArguments(arguments) {
+	if ok && pending.startsNewCall(call.ID, arguments) {
 		a.flushToolCall(call.Index)
 		ok = false
 	}
@@ -334,7 +387,7 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 		pending.upstreamID = call.ID
 	}
 	if call.Function != nil {
-		pending.observeName(call.Function.Name)
+		pending.observeName(name)
 		pending.arguments += arguments
 	}
 }
@@ -343,20 +396,25 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 // index first. Called when text arrives: text never appears part-way through a
 // call's arguments, so anything pending is over.
 func (a *anthropicStreamWriter) flushSettledToolCalls() {
-	a.flushSettledToolCallsBelow(-1)
+	a.flushSettledToolCallsUpTo(0, false)
 }
 
-// flushSettledToolCallsBelow emits pending calls that are not mid-object, lowest
-// index first, and stops at the first index that is at or above limit or is still
-// mid-object. Stopping rather than skipping keeps the emitted blocks in upstream's
-// index order. A negative limit means no bound.
+// flushSettledToolCallsBelow emits pending calls at an index below limit.
 func (a *anthropicStreamWriter) flushSettledToolCallsBelow(limit int) {
+	a.flushSettledToolCallsUpTo(limit, true)
+}
+
+// flushSettledToolCallsUpTo emits pending calls that are not mid-object, lowest
+// index first, and stops at the first index that is at or above limit (when
+// bounded) or is still mid-object. Stopping rather than skipping keeps the emitted
+// blocks in upstream's index order.
+func (a *anthropicStreamWriter) flushSettledToolCallsUpTo(limit int, bounded bool) {
 	for {
 		index, ok := a.lowestPendingToolIndex()
 		if !ok {
 			return
 		}
-		if limit >= 0 && index >= limit {
+		if bounded && index >= limit {
 			return
 		}
 		if a.pendingTools[index].midObject() {
@@ -387,6 +445,17 @@ func (a *anthropicStreamWriter) flushToolCall(upstreamIndex int) {
 		return
 	}
 	delete(a.pendingTools, upstreamIndex)
+	a.flushedTools[upstreamIndex] = flushedToolCall{
+		upstreamID: pending.upstreamID,
+		name:       pending.name,
+	}
+
+	// A tool call upstream never named cannot be invoked, and the Messages API
+	// never emits one, so it is dropped rather than sent as a block no client can
+	// act on. The non-streaming path drops the same shape.
+	if pending.name == "" {
+		return
+	}
 
 	// Whatever text came before is complete once a tool call is emitted.
 	a.closeTextBlock()

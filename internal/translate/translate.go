@@ -216,8 +216,23 @@ func geminiContentToOpenAIMessages(ctx context.Context, content gemini.Content, 
 	return assembleOpenAIMessages(geminiRoleToOpenAI(content.Role), contentParts, contentTextOnly, assistantToolCalls, toolMessages), nil
 }
 
+// assembleOpenAIMessages turns one source turn into the OpenAI messages it maps
+// to: at most one message for the turn's own content, plus a role:"tool" message
+// per tool result it carried.
+//
+// Ordering matters to the upstream runtime. A tool result answers the assistant
+// message that requested it, so it has to come before any other content in the
+// same turn: a user turn of [tool_result, text] must not put the text between the
+// assistant's tool call and its result. An assistant turn is the other way round,
+// since its own tool_calls are what a following tool message answers.
 func assembleOpenAIMessages(role string, contentParts []openaip.ContentPart, contentTextOnly bool, assistantToolCalls []openaip.ToolCall, toolMessages []openaip.Message) []openaip.Message {
 	messages := make([]openaip.Message, 0, 1+len(toolMessages))
+
+	toolResultsFirst := role != "assistant"
+	if toolResultsFirst {
+		messages = append(messages, toolMessages...)
+	}
+
 	if len(contentParts) > 0 || len(assistantToolCalls) > 0 {
 		message := openaip.Message{Role: role}
 		if len(contentParts) > 0 {
@@ -230,7 +245,11 @@ func assembleOpenAIMessages(role string, contentParts []openaip.ContentPart, con
 		}
 		messages = append(messages, message)
 	}
-	messages = append(messages, toolMessages...)
+
+	if !toolResultsFirst {
+		messages = append(messages, toolMessages...)
+	}
+
 	return messages
 }
 

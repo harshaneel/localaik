@@ -204,7 +204,13 @@ services:
 how the Anthropic SDKs signal streaming (there is no separate route).
 
 
-All other API routes return `404`.
+All other API routes return `404`, in the error shape of whichever protocol owns
+the path prefix.
+
+Note that `/v1/` is shared: `GET /v1/models` is served as the OpenAI models list,
+so an Anthropic client calling `client.models.list()` gets OpenAI-shaped data
+rather than a `404`. Only `/v1/messages` and `/v1/messages/count_tokens` are
+handled as Anthropic.
 
 ## Tested SDKs
 
@@ -285,7 +291,7 @@ jobs:
 - `image` blocks with a `url` source (the URL is passed to upstream as-is)
 - `tool_use` and `tool_result` blocks, including `is_error`
 - Tool definitions via `tools`, constrained via `tool_choice` (`auto`, `any`, `tool`, `none`)
-- `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`
+- `max_tokens` (required, and rejected below 1), `temperature`, `top_p`, `top_k`, `stop_sequences`
 - Streaming via `"stream": true`, emitted as the full Anthropic event sequence
   (`message_start`, `content_block_start` / `content_block_delta` / `content_block_stop`,
   `message_delta`, `message_stop`) so the SDK's own accumulator works unmodified
@@ -300,6 +306,8 @@ jobs:
 | `count_tokens` on multimodal input | Counts text only, including text-source `document` blocks. Images, base64 documents, and tool blocks are skipped, so counts run lower than the real API. |
 | Streamed tool arguments | Text streams token by token, but a tool call's arguments arrive in a single `input_json_delta` rather than several. The call is buffered until upstream moves on from it, because `content_block_start` has to commit to an id and name that upstream may still be revealing. SDK accumulators build the same result either way. |
 | `tool_use` ids when upstream sends none | Synthesized from the tool name, with a numeric suffix when that would collide. Two parallel calls to one tool would otherwise share an id, and the client's `tool_result` blocks key on it. |
+| A tool call upstream never named | Dropped. The Messages API never emits a `tool_use` without a name, and no client can invoke one. |
+| A tool call upstream repeats after finishing it | Recognised as an echo and ignored, rather than emitted a second time. A repeat that carries different arguments or a different id is treated as a genuinely new call. |
 | Streamed `usage` | Only as good as what upstream reports; the counts are zero when the runtime omits usage from streamed responses. |
 | A stream that ends without a `finish_reason` | Closed out as `end_turn` rather than reported as an error, so a runtime that omits the field still produces a usable response. A truncated upstream stream therefore looks complete. A `200` carrying no stream frames at all is reported as an error rather than an empty message. |
 | Anthropic's built-in tools in `tools` (web search, code execution, computer use, text editor, bash) | Skipped, along with `tool_choice` if nothing else remains. They are declared by a versioned `type` with no `input_schema`, so there is nothing to describe to the local model, and offering them would invite calls that go nowhere. |
