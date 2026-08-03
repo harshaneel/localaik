@@ -1,10 +1,8 @@
 package server
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -56,46 +54,15 @@ func (s *Server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	upstreamPayload, err := json.Marshal(map[string]any{
-		"content":     translate.CountTokensTextFromGemini(req.Contents),
-		"add_special": false,
-	})
-	if err != nil {
-		gemini.WriteError(w, http.StatusInternalServerError, "failed to serialize upstream request")
+	count, upstreamStatus, upstreamBody, upstreamErr := s.countUpstreamTokens(r, translate.CountTokensTextFromGemini(req.Contents))
+	if upstreamErr != nil {
+		gemini.WriteError(w, upstreamErr.status, upstreamErr.Error())
+		return
+	}
+	if upstreamStatus >= http.StatusBadRequest {
+		writeJSON(w, upstreamStatus, translate.OpenAIErrorToGemini(upstreamStatus, upstreamBody))
 		return
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.upstreamTokenizeURL, bytes.NewReader(upstreamPayload))
-	if err != nil {
-		gemini.WriteError(w, http.StatusInternalServerError, "failed to create upstream request")
-		return
-	}
-	upstreamReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.client.Do(upstreamReq)
-	if err != nil {
-		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream: %v", err))
-		return
-	}
-	defer resp.Body.Close()
-
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to read upstream response: %v", readErr))
-		return
-	}
-	if resp.StatusCode >= http.StatusBadRequest {
-		writeJSON(w, resp.StatusCode, translate.OpenAIErrorToGemini(resp.StatusCode, body))
-		return
-	}
-
-	var upstreamResp struct {
-		Tokens []any `json:"tokens"`
-	}
-	if err := json.Unmarshal(body, &upstreamResp); err != nil {
-		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to parse upstream response: %v", err))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, gemini.CountTokensResponse{TotalTokens: len(upstreamResp.Tokens)})
+	writeJSON(w, http.StatusOK, gemini.CountTokensResponse{TotalTokens: count})
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/harshaneel/localaik/internal/pdf"
+	"github.com/harshaneel/localaik/internal/protocol/anthropic"
 	"github.com/harshaneel/localaik/internal/protocol/gemini"
 	openaip "github.com/harshaneel/localaik/internal/protocol/openai"
 )
@@ -72,6 +73,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleOpenAIPassthrough(w, r, s.upstreamChatURL)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/completions":
 		s.handleOpenAIPassthrough(w, r, s.upstreamCompletions)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages/count_tokens":
+		s.handleAnthropicCountTokens(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
+		s.handleAnthropicMessages(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		s.handleOpenAIModelsList(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/models/"):
@@ -117,6 +122,8 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/v1beta/"):
 		gemini.WriteError(w, http.StatusNotFound, "route not found")
+	case r.URL.Path == "/v1/messages" || strings.HasPrefix(r.URL.Path, "/v1/messages/"):
+		anthropic.WriteError(w, http.StatusNotFound, "route not found")
 	case strings.HasPrefix(r.URL.Path, "/v1/"):
 		openaip.WriteError(w, http.StatusNotFound, "route not found", "invalid_request_error")
 	default:
@@ -159,6 +166,7 @@ func cloneHeaders(src http.Header) http.Header {
 		if strings.EqualFold(key, "Authorization") ||
 			strings.EqualFold(key, "Content-Length") ||
 			strings.EqualFold(key, "Host") ||
+			strings.EqualFold(key, "X-Api-Key") ||
 			strings.EqualFold(key, "X-Goog-Api-Key") {
 			continue
 		}
