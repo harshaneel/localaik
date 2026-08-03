@@ -471,7 +471,14 @@ func TestAnthropicToolChoiceMapping(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := decodeAnthropicRequest(t, `{"max_tokens":8,"tool_choice":`+tc.json+`,"messages":[{"role":"user","content":"hi"}]}`)
+			// A tool has to survive translation for tool_choice to be forwarded at
+			// all; see TestAnthropicRequestToOpenAIDropsToolChoiceWithNoTools.
+			req := decodeAnthropicRequest(t, `{
+				"max_tokens": 8,
+				"tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+				"tool_choice": `+tc.json+`,
+				"messages": [{"role": "user", "content": "hi"}]
+			}`)
 
 			got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
 			if err != nil {
@@ -719,14 +726,14 @@ func TestOpenAIFinishReasonToAnthropic(t *testing.T) {
 	}
 }
 
-// Clients that omit ids must still produce a matching tool_call_id / tool call
-// pair, since an empty tool_call_id is not a usable OpenAI value.
-func TestAnthropicToolIDFallbacksAgreeAcrossSides(t *testing.T) {
+// Ids supplied by the client must survive unchanged on both sides, which is the
+// only case Anthropic actually permits: id and tool_use_id are both required.
+func TestAnthropicToolIDsPassThroughOnBothSides(t *testing.T) {
 	req := decodeAnthropicRequest(t, `{
 		"max_tokens": 32,
 		"messages": [
-			{"role": "assistant", "content": [{"type": "tool_use", "name": "", "input": {}}]},
-			{"role": "user", "content": [{"type": "tool_result", "content": "done"}]}
+			{"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_7", "name": "get_weather", "input": {}}]},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_7", "content": "done"}]}
 		]
 	}`)
 
@@ -737,16 +744,73 @@ func TestAnthropicToolIDFallbacksAgreeAcrossSides(t *testing.T) {
 	if len(got.Messages) != 2 {
 		t.Fatalf("messages = %#v, want assistant + tool", got.Messages)
 	}
-
-	if len(got.Messages[0].ToolCalls) != 1 {
-		t.Fatalf("assistant tool calls = %#v, want one", got.Messages[0].ToolCalls)
+	if len(got.Messages[0].ToolCalls) != 1 || got.Messages[0].ToolCalls[0].ID != "toolu_7" {
+		t.Fatalf("assistant tool calls = %#v, want the client id preserved", got.Messages[0].ToolCalls)
 	}
-	callID := got.Messages[0].ToolCalls[0].ID
-	if callID == "" {
+	if got.Messages[1].ToolCallID != "toolu_7" {
+		t.Fatalf("tool_call_id = %q, want toolu_7", got.Messages[1].ToolCallID)
+	}
+}
+
+// A malformed request that omits ids cannot be re-paired: a tool_result has no
+// name to derive one from. The only guarantee is that neither side goes upstream
+// with an empty tool_call_id, which OpenAI would reject outright.
+func TestAnthropicMissingToolIDsStillProduceNonEmptyIDs(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 32,
+		"messages": [
+			{"role": "assistant", "content": [{"type": "tool_use", "name": "get_weather", "input": {}}]},
+			{"role": "user", "content": [{"type": "tool_result", "content": "done"}]}
+		]
+	}`)
+
+	got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+	if got.Messages[0].ToolCalls[0].ID == "" {
 		t.Fatal("tool call id is empty")
 	}
-	if got.Messages[1].ToolCallID != callID {
-		t.Fatalf("tool_call_id = %q, want it to match the tool call id %q", got.Messages[1].ToolCallID, callID)
+	if got.Messages[1].ToolCallID == "" {
+		t.Fatal("tool_call_id is empty")
+	}
+}
+
+// Skipping every declared tool must also drop tool_choice: pointing it at a tool
+// that is no longer in the request is rejected by the upstream runtime.
+func TestAnthropicRequestToOpenAIDropsToolChoiceWithNoTools(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "all_tools_skipped",
+			body: `{"max_tokens":32,
+				"tools":[{"type":"web_search_20250305","name":"web_search"}],
+				"tool_choice":{"type":"tool","name":"web_search"},
+				"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name: "no_tools_declared",
+			body: `{"max_tokens":32,"tool_choice":{"type":"any"},"messages":[{"role":"user","content":"hi"}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := decodeAnthropicRequest(t, tc.body)
+
+			got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+			if err != nil {
+				t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+			}
+			if len(got.Tools) != 0 {
+				t.Fatalf("tools = %#v, want none", got.Tools)
+			}
+			if got.ToolChoice != nil {
+				t.Fatalf("tool_choice = %#v, want nil when there are no tools", got.ToolChoice)
+			}
+		})
 	}
 }
 

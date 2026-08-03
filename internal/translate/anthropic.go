@@ -66,7 +66,12 @@ func AnthropicRequestToOpenAI(ctx context.Context, req anthropic.MessagesRequest
 	}
 
 	result.Tools = anthropicToolsToOpenAITools(req.Tools)
-	result.ToolChoice = anthropicToolChoiceToOpenAI(req.ToolChoice)
+	// A tool_choice with no tools to choose from is rejected by the upstream
+	// runtime, so it is dropped rather than left pointing at a tool that was
+	// skipped above.
+	if len(result.Tools) > 0 {
+		result.ToolChoice = anthropicToolChoiceToOpenAI(req.ToolChoice)
+	}
 
 	return result, nil
 }
@@ -134,10 +139,14 @@ func OpenAIErrorToAnthropic(statusCode int, body []byte) anthropic.ErrorResponse
 }
 
 // CountTokensTextFromAnthropic flattens a Messages request into a single text
-// payload for llama.cpp's /tokenize endpoint. Blocks the text tokenizer cannot
-// measure (images, base64 documents, tool call inputs) are skipped, so counts
-// for those requests come out lower than the real API reports. Text-source
-// document blocks are included, since /v1/messages inlines them into the prompt.
+// payload for llama.cpp's /tokenize endpoint.
+//
+// The walk covers whatever /v1/messages turns into prompt text, so the two paths
+// agree on what a request contains: text blocks, text-source documents, and
+// tool_result bodies including the placeholders non-text results become. What
+// the text tokenizer genuinely cannot measure is skipped (images, base64
+// documents, tool call inputs, tool definitions), so counts for those requests
+// come out lower than the real API reports.
 func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 	var b strings.Builder
 
@@ -151,18 +160,14 @@ func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 		b.WriteString(text)
 	}
 
-	if req.System != nil {
-		appendText(req.System.Text())
-	}
-
-	for _, message := range req.Messages {
-		for _, block := range message.Content.Blocks {
+	appendBlocks := func(blocks []anthropic.ContentBlock) {
+		for _, block := range blocks {
 			switch block.Type {
 			case anthropic.BlockTypeText:
 				appendText(block.Text)
 			case anthropic.BlockTypeToolResult:
 				if block.Content != nil {
-					appendText(block.Content.Text())
+					appendText(anthropicToolResultText(*block.Content))
 				}
 			case anthropic.BlockTypeDocument:
 				if block.Source != nil && block.Source.Type == anthropic.SourceTypeText {
@@ -170,6 +175,16 @@ func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 				}
 			}
 		}
+	}
+
+	// system takes the same walk as a message body: it accepts the same block
+	// shapes, and /v1/messages inlines them the same way.
+	if req.System != nil {
+		appendBlocks(req.System.Blocks)
+	}
+
+	for _, message := range req.Messages {
+		appendBlocks(message.Content.Blocks)
 	}
 
 	return b.String()
@@ -309,8 +324,12 @@ func anthropicToolResultToOpenAIMessage(block anthropic.ContentBlock) openaip.Me
 
 	return openaip.Message{
 		Role: "tool",
-		// Same fallback as the tool_use side, so a client that omits ids still
-		// produces a matching pair rather than an empty tool_call_id.
+		// A tool_result carries only tool_use_id, with no name to fall back on, so
+		// an absent id can only become a placeholder. That will not match the
+		// name-derived id the tool_use side synthesizes: a request omitting ids on
+		// both sides is malformed Anthropic (both fields are required) and cannot
+		// be re-paired here. The placeholder exists only so the message does not go
+		// upstream with an empty tool_call_id.
 		ToolCallID: toolCallID(block.ToolUseID, ""),
 		Content:    text,
 	}
@@ -359,11 +378,14 @@ func anthropicToolsToOpenAITools(tools []anthropic.Tool) []openaip.Tool {
 		if tool.Name == "" {
 			continue
 		}
-		// Server tools (computer use, web search, code execution) are identified by
-		// a versioned `type` and carry no input_schema. localaik cannot run them, so
-		// they are skipped rather than forwarded as a parameterless function that
-		// the model might try to call.
-		if tool.Type != "" && tool.Type != "custom" {
+		// Anthropic's built-in tools (web search, code execution, computer use,
+		// text editor, bash) are declared by a versioned `type` and carry no
+		// input_schema, because their shape is implied by that type rather than
+		// described. There is nothing to hand llama.cpp, so they are skipped
+		// instead of forwarded as a parameterless function the model might call.
+		// Keying on the absent schema rather than on the type string also means a
+		// future tool type that does ship a schema still gets forwarded.
+		if tool.InputSchema == nil {
 			continue
 		}
 		out = append(out, openaip.Tool{
@@ -372,7 +394,7 @@ func anthropicToolsToOpenAITools(tools []anthropic.Tool) []openaip.Tool {
 				Name:        tool.Name,
 				Description: tool.Description,
 				Parameters:  normalizeJSONSchema(tool.InputSchema),
-				Strict:      tool.InputSchema != nil,
+				Strict:      true,
 			},
 		})
 	}

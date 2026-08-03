@@ -113,14 +113,47 @@ type anthropicStreamWriter struct {
 }
 
 // toolBlockRef remembers which Anthropic block an upstream tool-call index maps
-// to, along with the identity of the call occupying it. The identity matters
-// because OpenAI's tool-call index is `omitempty`: an upstream that never sends
-// it is indistinguishable from one that always sends 0, so index alone would
-// merge separate calls into one block and concatenate their JSON.
+// to, along with enough about the call occupying it to tell a continuation from
+// a different call. Identity matters because OpenAI's tool-call index is
+// `omitempty`: an upstream that never sends it is indistinguishable from one
+// that always sends 0, so index alone would merge separate calls into one block
+// and concatenate their JSON.
+//
+// upstreamID is the id exactly as upstream sent it, kept apart from the id
+// emitted downstream, which may have been synthesized from the name.
 type toolBlockRef struct {
-	index int
-	id    string
-	name  string
+	index      int
+	upstreamID string
+	name       string
+	arguments  string
+}
+
+// argumentsComplete reports whether the fragments seen so far form a whole JSON
+// value. A call still mid-object cannot have ended, whatever its next delta says.
+func (r toolBlockRef) argumentsComplete() bool {
+	return r.arguments == "" || json.Valid([]byte(r.arguments))
+}
+
+// startsNewToolCall reports whether a tool-call delta belongs to a different call
+// than the one already occupying its index.
+//
+// Arguments completeness gates the decision: a block holding a half-written JSON
+// object is always treated as a continuation, because splitting there would leave
+// two blocks each holding an unparseable fragment, and the SDK accumulators
+// marshal a block when it stops. Only once the current call's arguments parse can
+// a differing identity mean a genuinely new call.
+//
+// Ids win when either side has one. Names are only compared when neither does,
+// and only when both are non-empty, so a name that arrives a delta later than the
+// id does not look like a new call.
+func startsNewToolCall(ref toolBlockRef, id, name string) bool {
+	if !ref.argumentsComplete() {
+		return false
+	}
+	if ref.upstreamID != "" || id != "" {
+		return id != "" && ref.upstreamID != "" && id != ref.upstreamID
+	}
+	return name != "" && ref.name != "" && name != ref.name
 }
 
 func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStreamWriter {
@@ -252,10 +285,6 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 	}
 
 	ref, known := a.toolBlocks[call.Index]
-	// A delta that names a different call than the one holding this index means
-	// upstream started a new tool call rather than continuing the old one. Later
-	// fragments of a call carry no id or name, so only a differing non-empty
-	// value counts as a new call.
 	if known && startsNewToolCall(ref, call.ID, name) {
 		known = false
 	}
@@ -263,15 +292,25 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 	if !known {
 		// Any text so far is complete once a tool call begins.
 		a.closeTextBlock()
-		id := anthropicToolUseID(call.ID, name)
 		ref = toolBlockRef{
-			index: a.startBlock(anthropic.ToolUseStreamBlock(id, name)),
-			id:    id,
-			name:  name,
+			index:      a.startBlock(anthropic.ToolUseStreamBlock(anthropicToolUseID(call.ID, name), name)),
+			upstreamID: call.ID,
+			name:       name,
 		}
-		a.toolBlocks[call.Index] = ref
+	} else {
+		// Fill in identity that arrived a delta later than the block was opened.
+		if ref.upstreamID == "" {
+			ref.upstreamID = call.ID
+		}
+		if ref.name == "" {
+			ref.name = name
+		}
 	}
-	index := ref.index
+
+	if call.Function != nil && call.Function.Arguments != "" {
+		ref.arguments += call.Function.Arguments
+	}
+	a.toolBlocks[call.Index] = ref
 
 	if call.Function == nil || call.Function.Arguments == "" {
 		return
@@ -279,23 +318,12 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 
 	a.writeEvent(anthropic.EventContentBlockDelta, anthropic.ContentBlockDeltaEvent{
 		Type:  anthropic.EventContentBlockDelta,
-		Index: index,
+		Index: ref.index,
 		Delta: anthropic.BlockDelta{
 			Type:        anthropic.DeltaTypeInputJSON,
 			PartialJSON: call.Function.Arguments,
 		},
 	})
-}
-
-// startsNewToolCall reports whether a tool-call delta identifies a different
-// call than the one already occupying its index. An id or name is only sent on
-// a call's first delta, so an empty value means "continuation" rather than
-// "different call".
-func startsNewToolCall(ref toolBlockRef, id, name string) bool {
-	if id != "" && id != ref.id {
-		return true
-	}
-	return name != "" && name != ref.name
 }
 
 // startBlock emits content_block_start for a new block and returns its index.
@@ -336,8 +364,9 @@ func (a *anthropicStreamWriter) closeBlock(index int) {
 }
 
 // finish closes the stream with the terminal message_delta and message_stop
-// events. An upstream stream that produced no chunks still yields a well-formed
-// Anthropic stream.
+// events. A stream whose only frame was [DONE] still yields a well-formed
+// Anthropic stream describing an empty message; a stream with no frames at all
+// never reaches here, since the caller reports that as an error.
 func (a *anthropicStreamWriter) finish() error {
 	if a.finished {
 		return a.writeErr

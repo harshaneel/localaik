@@ -227,6 +227,132 @@ func TestSDKAnthropicMessagesStreamingInterleavedToolCalls(t *testing.T) {
 	}
 }
 
+// Awkward upstream tool-call shapes, checked through the SDK's own accumulator
+// rather than by counting events: it rejects gap-indexed blocks and fails to
+// marshal a block whose input is not valid JSON, so it catches split or merged
+// calls that an event-sequence assertion would miss.
+func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
+	cases := []struct {
+		name   string
+		chunks []string
+		want   []map[string]any
+	}{
+		{
+			// No `index` at all: two calls that must not collapse into one block.
+			name: "no_index_two_calls",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
+			},
+			want: []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+		},
+		{
+			// No `index`, and each call's arguments split across deltas.
+			name: "no_index_fragmented_arguments",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]}}]}`,
+			},
+			want: []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+		},
+		{
+			// The id shows up a delta after the name, so the block was opened with a
+			// synthesized id. That must not read as a second call.
+			name: "id_arrives_after_name",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"only","arguments":"{\"a\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"arguments":"1}"}}]}}]}`,
+			},
+			want: []map[string]any{{"a": float64(1)}},
+		},
+		{
+			// Upstream resumes an earlier index after starting a later one.
+			name: "interleaved_indices",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+			},
+			want: []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+		},
+		{
+			// Text before and between tool calls, so text and tool blocks interleave.
+			name: "text_between_tool_calls",
+			chunks: []string{
+				`{"choices":[{"delta":{"content":"thinking"}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
+				`{"choices":[{"delta":{"content":"more"}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
+			},
+			want: []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks := append([]string{}, tc.chunks...)
+			chunks = append(chunks, `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`, `[DONE]`)
+
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				for _, chunk := range chunks {
+					_, _ = w.Write([]byte("data: " + chunk + "\n\n"))
+				}
+			})
+
+			client := newAnthropicSDKClient(t, upstream)
+
+			stream := client.Messages.NewStreaming(context.Background(), anthropicsdk.MessageNewParams{
+				Model:     anthropicsdk.ModelClaudeSonnet4_5,
+				MaxTokens: 128,
+				Messages: []anthropicsdk.MessageParam{
+					anthropicsdk.NewUserMessage(anthropicsdk.NewTextBlock("go")),
+				},
+			})
+
+			accumulated := anthropicsdk.Message{}
+			for stream.Next() {
+				if err := accumulated.Accumulate(stream.Current()); err != nil {
+					t.Fatalf("Accumulate returned error: %v", err)
+				}
+			}
+			if err := stream.Err(); err != nil {
+				t.Fatalf("stream error: %v", err)
+			}
+
+			var inputs []map[string]any
+			for _, block := range accumulated.Content {
+				toolUse, ok := block.AsAny().(anthropicsdk.ToolUseBlock)
+				if !ok {
+					continue
+				}
+				var input map[string]any
+				if err := json.Unmarshal(toolUse.Input, &input); err != nil {
+					t.Fatalf("tool input %s does not decode: %v", toolUse.Input, err)
+				}
+				inputs = append(inputs, input)
+			}
+
+			if len(inputs) != len(tc.want) {
+				t.Fatalf("accumulated %d tool_use blocks, want %d; content = %#v", len(inputs), len(tc.want), accumulated.Content)
+			}
+			for i, want := range tc.want {
+				if len(inputs[i]) != len(want) {
+					t.Fatalf("tool input %d = %#v, want %#v", i, inputs[i], want)
+				}
+				for key, value := range want {
+					if inputs[i][key] != value {
+						t.Fatalf("tool input %d = %#v, want %#v", i, inputs[i], want)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestSDKAnthropicMessagesToolUse(t *testing.T) {
 	var upstreamReq openaip.ChatCompletionRequest
 
