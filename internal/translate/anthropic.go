@@ -13,12 +13,8 @@ import (
 	openaip "github.com/harshaneel/localaik/internal/protocol/openai"
 )
 
-// AnthropicRequestToOpenAI converts an Anthropic Messages request into the
-// OpenAI chat completion request llama.cpp serves.
-//
-// max_tokens is required by the Messages API, so a missing value is rejected
-// here rather than silently defaulted — matching what a client would get from
-// the real endpoint.
+// AnthropicRequestToOpenAI converts an Anthropic Messages request into the OpenAI
+// chat completion request llama.cpp serves.
 func AnthropicRequestToOpenAI(ctx context.Context, req anthropic.MessagesRequest, renderer pdf.Renderer) (openaip.ChatCompletionRequest, error) {
 	if req.MaxTokens == nil {
 		return openaip.ChatCompletionRequest{}, fmt.Errorf("max_tokens: field required")
@@ -72,9 +68,7 @@ func AnthropicRequestToOpenAI(ctx context.Context, req anthropic.MessagesRequest
 	}
 
 	result.Tools = anthropicToolsToOpenAITools(req.Tools)
-	// A tool_choice with no tools to choose from is rejected by the upstream
-	// runtime, so it is dropped rather than left pointing at a tool that was
-	// skipped above.
+	// tool_choice with no tools is rejected upstream.
 	if len(result.Tools) > 0 {
 		result.ToolChoice = anthropicToolChoiceToOpenAI(req.ToolChoice)
 	}
@@ -82,9 +76,8 @@ func AnthropicRequestToOpenAI(ctx context.Context, req anthropic.MessagesRequest
 	return result, nil
 }
 
-// validateAnthropicSampling rejects sampling parameters outside the ranges the
-// Messages API accepts, so a request that would 400 against the real endpoint does
-// so here rather than being silently passed to a runtime with different bounds.
+// validateAnthropicSampling rejects values outside the ranges the Messages API
+// accepts.
 func validateAnthropicSampling(req anthropic.MessagesRequest) error {
 	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 1) {
 		return fmt.Errorf("temperature: input should be between 0 and 1")
@@ -99,11 +92,7 @@ func validateAnthropicSampling(req anthropic.MessagesRequest) error {
 }
 
 // OpenAIResponseToAnthropic converts an upstream chat completion into a Messages
-// API reply. model is the model the client asked for, echoed back the way the
-// real API does.
-//
-// The Messages API returns a single message, so only the first choice is used;
-// any additional choices are dropped.
+// API reply, echoing back the model the client asked for.
 func OpenAIResponseToAnthropic(resp openaip.ChatCompletionResponse, model string) anthropic.MessagesResponse {
 	out := anthropic.MessagesResponse{
 		ID:      anthropicMessageID(resp.ID),
@@ -162,15 +151,9 @@ func OpenAIErrorToAnthropic(statusCode int, body []byte) anthropic.ErrorResponse
 	}
 }
 
-// CountTokensTextFromAnthropic flattens a Messages request into a single text
-// payload for llama.cpp's /tokenize endpoint.
-//
-// The walk covers whatever /v1/messages turns into prompt text, so the two paths
-// agree on what a request contains: text blocks, text-source documents, and
-// tool_result bodies including the placeholders non-text results become. What
-// the text tokenizer genuinely cannot measure is skipped (images, base64
-// documents, tool call inputs, tool definitions), so counts for those requests
-// come out lower than the real API reports.
+// CountTokensTextFromAnthropic flattens a Messages request into the text payload
+// llama.cpp's /tokenize endpoint takes. It walks whatever /v1/messages turns into
+// prompt text, so the two agree; see the README for what is left out.
 func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 	var b strings.Builder
 
@@ -201,8 +184,6 @@ func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 		}
 	}
 
-	// system takes the same walk as a message body: it accepts the same block
-	// shapes, and /v1/messages inlines them the same way.
 	if req.System != nil {
 		appendBlocks(req.System.Blocks)
 	}
@@ -216,10 +197,6 @@ func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 
 // OpenAIFinishReasonToAnthropic maps an OpenAI finish_reason to an Anthropic
 // stop_reason.
-//
-// llama.cpp reports "stop" both for a natural end of turn and for a
-// stop_sequences hit, so "stop_sequence" is never produced — such requests come
-// back as "end_turn".
 func OpenAIFinishReasonToAnthropic(reason string) string {
 	switch strings.ToLower(reason) {
 	case "":
@@ -233,16 +210,9 @@ func OpenAIFinishReasonToAnthropic(reason string) string {
 	}
 }
 
-// AnthropicStopReason resolves the stop_reason for a message, given the upstream
-// finish_reason and whether the message ended up carrying tool_use blocks.
-//
-// Some runtimes report finish_reason "stop", or nothing at all, alongside tool
-// calls. Agent loops branch on stop_reason to decide whether to run tools and
-// reply with tool_result, so a message carrying tool_use has to say tool_use.
-//
-// A "length" finish is left alone: the arguments were cut off mid-generation, and
-// reporting max_tokens is both what the real API does and what stops an agent
-// executing a truncated call.
+// AnthropicStopReason resolves a message's stop_reason. A message carrying
+// tool_use reports tool_use, except after a "length" finish, which stays
+// max_tokens because the arguments were truncated.
 func AnthropicStopReason(finishReason string, hasToolUse bool) string {
 	reason := OpenAIFinishReasonToAnthropic(finishReason)
 	if !hasToolUse {
@@ -377,12 +347,8 @@ func anthropicToolResultToOpenAIMessage(block anthropic.ContentBlock) openaip.Me
 
 	return openaip.Message{
 		Role: "tool",
-		// A tool_result carries only tool_use_id, with no name to fall back on, so
-		// an absent id can only become a placeholder. That will not match the
-		// name-derived id the tool_use side synthesizes: a request omitting ids on
-		// both sides is malformed Anthropic (both fields are required) and cannot
-		// be re-paired here. The placeholder exists only so the message does not go
-		// upstream with an empty tool_call_id.
+		// A placeholder only so the message does not carry an empty tool_call_id; it
+		// cannot be re-paired with the tool_use side.
 		ToolCallID: toolCallID(block.ToolUseID, ""),
 		Content:    text,
 	}
@@ -431,13 +397,8 @@ func anthropicToolsToOpenAITools(tools []anthropic.Tool) []openaip.Tool {
 		if tool.Name == "" {
 			continue
 		}
-		// Anthropic's built-in tools (web search, code execution, computer use,
-		// text editor, bash) are declared by a versioned `type` and carry no
-		// input_schema, because their shape is implied by that type rather than
-		// described. There is nothing to hand llama.cpp, so they are skipped
-		// instead of forwarded as a parameterless function the model might call.
-		// Keying on the absent schema rather than on the type string also means a
-		// future tool type that does ship a schema still gets forwarded.
+		// Anthropic's built-in tools carry no input_schema, so there is nothing to
+		// describe to the model.
 		if tool.InputSchema == nil {
 			continue
 		}
@@ -507,12 +468,6 @@ func openAIToolCallsToAnthropicBlocks(calls []openaip.ToolCall) []anthropic.Cont
 }
 
 // toolUseIDs hands out tool_use ids that are unique within one message.
-//
-// An upstream that sends no tool-call ids leaves nothing to derive them from but
-// the tool name, so two parallel calls to the same tool would otherwise share an
-// id. The client's tool_result blocks would then carry duplicate tool_use_ids,
-// which the real API rejects on the next turn, breaking an agent loop a turn
-// after the mistake was made.
 type toolUseIDs struct {
 	used map[string]bool
 }
@@ -536,12 +491,7 @@ func (t *toolUseIDs) assign(id, name string) string {
 }
 
 // anthropicToolInput normalises OpenAI's stringified arguments into the JSON
-// object Anthropic's tool_use.input expects.
-//
-// tool_use.input is always an object, so anything that is empty, malformed, or
-// valid-but-not-an-object (a bare "null", array, or string) becomes an empty
-// object rather than being passed through. Clients decode input into a struct
-// and would fail on the other shapes.
+// object tool_use.input expects, replacing anything that is not one with {}.
 func anthropicToolInput(arguments string) json.RawMessage {
 	if !isJSONObject(arguments) {
 		return json.RawMessage(`{}`)

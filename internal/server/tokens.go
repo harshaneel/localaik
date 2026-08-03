@@ -8,9 +8,7 @@ import (
 	"net/http"
 )
 
-// upstreamError pairs a failure talking to llama.cpp with the HTTP status
-// localaik should report for it, so each protocol handler can render the message
-// in its own error shape without re-deriving the status.
+// upstreamError pairs a failure talking to llama.cpp with the status to report.
 type upstreamError struct {
 	status  int
 	message string
@@ -18,11 +16,9 @@ type upstreamError struct {
 
 func (e *upstreamError) Error() string { return e.message }
 
-// countUpstreamTokens tokenizes text via llama.cpp's /tokenize endpoint.
-//
-// On success it returns the token count. When upstream answers with a non-2xx
-// status it returns that status and the raw body with a nil error, so the caller
-// can translate the upstream error into its own protocol shape.
+// countUpstreamTokens tokenizes text via llama.cpp's /tokenize endpoint. A non-2xx
+// upstream status is returned with the raw body and a nil error, for the caller to
+// translate into its own shape.
 func (s *Server) countUpstreamTokens(r *http.Request, text string) (count int, upstreamStatus int, upstreamBody []byte, err *upstreamError) {
 	payload, marshalErr := json.Marshal(map[string]any{
 		"content":     text,

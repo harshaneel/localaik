@@ -1,7 +1,5 @@
 // Package anthropic models the wire format of the Anthropic Messages API
-// (https://docs.anthropic.com/en/api/messages) as served by localaik. Only the
-// fields localaik reads or emits are represented; unknown fields decode away
-// silently so newer SDK versions keep working.
+// (https://docs.anthropic.com/en/api/messages).
 package anthropic
 
 import (
@@ -33,9 +31,8 @@ type Message struct {
 	Content Content `json:"content"`
 }
 
-// Content holds a message body or system prompt. The wire format allows either
-// a bare string or an array of typed blocks; both decode into Blocks. IsString
-// records which form arrived so a value re-marshals in the shape it came in.
+// Content holds a message body or system prompt, which the wire format allows as
+// either a bare string or an array of blocks. IsString records which arrived.
 type Content struct {
 	Blocks   []ContentBlock
 	IsString bool
@@ -217,11 +214,9 @@ const (
 	EventError             = "error"
 )
 
-// The types below are the write side of the event stream. They are kept separate
-// from StreamEvent because the Messages API is specific about which fields are
-// present-but-null versus omitted, and that differs per event: a
-// content_block_delta must not carry stop fields, while a message_delta must
-// carry them even when null. StreamEvent stays the permissive decode-side union.
+// The types below are the write side of the event stream, one per event, because
+// which fields are present-but-null differs per event. StreamEvent is the
+// permissive decode side.
 
 // MessageStartEvent opens the stream.
 type MessageStartEvent struct {
@@ -313,9 +308,7 @@ type ErrorEvent struct {
 	Error Error  `json:"error"`
 }
 
-// StreamEvent is the union of every server-sent event the Messages API emits.
-// Which fields are populated depends on Type. This is the decode-side type; the
-// writer emits the per-event types above.
+// StreamEvent decodes any server-sent event; which fields are set depends on Type.
 type StreamEvent struct {
 	Type string `json:"type"`
 

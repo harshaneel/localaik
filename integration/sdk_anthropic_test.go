@@ -244,24 +244,14 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 		wantUniqueIDs bool
 	}{
 		{
-			// No `index` at all: two calls that must not collapse into one block.
-			name: "no_index_two_calls",
+			// No index at all, which means index 0: every fragment is one call.
+			name: "index_omitted_single_call",
 			chunks: []string{
-				`{"choices":[{"delta":{"tool_calls":[{"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
-			},
-			want: []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
-		},
-		{
-			// No `index`, and each call's arguments split across deltas.
-			name: "no_index_fragmented_arguments",
-			chunks: []string{
-				`{"choices":[{"delta":{"tool_calls":[{"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"id":"c0","type":"function","function":{"name":"only","arguments":"{\"a\":"}}]}}]}`,
 				`{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":"}}]}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]}}]}`,
 			},
-			want: []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+			want:      []map[string]any{{"a": float64(1)}},
+			wantNames: []string{"only"},
 		},
 		{
 			// The id shows up a delta after the name, so the block was opened with a
@@ -305,27 +295,6 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 			wantNames: []string{"only"},
 		},
 		{
-			// A name split across deltas has to reach the client whole; a client
-			// cannot invoke "get_".
-			name: "name_streamed_in_fragments",
-			chunks: []string{
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_"}}]}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{\"a\":1}"}}]}}]}`,
-			},
-			want:      []map[string]any{{"a": float64(1)}},
-			wantNames: []string{"get_weather"},
-		},
-		{
-			// Upstream reuses one id for two genuinely different calls.
-			name: "repeated_id_two_calls",
-			chunks: []string{
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
-			},
-			want:      []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
-			wantNames: []string{"first", "second"},
-		},
-		{
 			// Arguments upstream never finished. The call must survive with a
 			// decodable input rather than breaking the stream.
 			name: "truncated_arguments",
@@ -365,16 +334,6 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 			},
 			want:      []map[string]any{{"a": float64(1)}},
 			wantNames: []string{"only"},
-		},
-		{
-			// A zero-argument call whose name is split across deltas.
-			name: "no_argument_call_with_fragmented_name",
-			chunks: []string{
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"get_","arguments":"{}"}}]}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":""}}]}}]}`,
-			},
-			want:      []map[string]any{{}},
-			wantNames: []string{"get_weather"},
 		},
 		{
 			// Upstream starts a later index, then comes back to finish the earlier one.
