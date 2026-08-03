@@ -787,6 +787,44 @@ func TestWriteAnthropicStreamEchoesOfFlushedToolCalls(t *testing.T) {
 			},
 		},
 		{
+			// A gateway that resends the whole array *with arguments* on a later
+			// chunk. Every fixture before this one resent with empty arguments, which
+			// is why this shape survived a round of fixes.
+			name: "resent_with_arguments",
+			upstream: []string{
+				firstCall,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}},{"index":1,"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "first", input: `{"a":1}`},
+				{id: "c1", name: "second", input: `{"b":2}`},
+			},
+		},
+		{
+			// The same for a single call, where the resend lands while the call is
+			// still pending rather than already emitted.
+			name: "single_call_resent_with_arguments",
+			upstream: []string{
+				firstCall,
+				firstCall,
+				firstCall,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "first", input: `{"a":1}`},
+			},
+		},
+		{
+			// An id that arrives in fragments is one call continuing, not two.
+			name: "fragmented_id_is_one_call",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_","type":"function","function":{"name":"first"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"arguments":"{\"a\":1}"}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "call_abc", name: "first", input: `{"a":1}`},
+			},
+		},
+		{
 			// A delta at a flushed index that brings a genuinely different id is a new
 			// call, not an echo, and must still be emitted. Blocks are ordered by
 			// upstream index, so revisiting index 0 while index 1 is open places the

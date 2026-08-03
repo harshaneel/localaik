@@ -297,6 +297,25 @@ func TestServerAnthropicCountTokensWithoutMaxTokens(t *testing.T) {
 	}
 }
 
+// count_tokens measures a prompt, so it needs one. /v1/messages validates its
+// input and this route should not be the lenient exception.
+func TestServerAnthropicCountTokensRejectsEmptyRequests(t *testing.T) {
+	for _, body := range []string{`{}`, `{"messages":[]}`} {
+		t.Run(body, func(t *testing.T) {
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatalf("upstream should not be called; got %s %s", r.Method, r.URL.Path)
+			})
+			srv := newTestServer(t, upstream)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewBufferString(body))
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+
+			assertAnthropicError(t, rec, http.StatusBadRequest, anthropic.ErrorTypeInvalidRequest)
+		})
+	}
+}
+
 func TestServerAnthropicCountTokensUpstreamError(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

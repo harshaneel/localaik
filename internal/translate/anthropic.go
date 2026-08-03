@@ -26,6 +26,9 @@ func AnthropicRequestToOpenAI(ctx context.Context, req anthropic.MessagesRequest
 	if *req.MaxTokens < 1 {
 		return openaip.ChatCompletionRequest{}, fmt.Errorf("max_tokens: input should be greater than or equal to 1")
 	}
+	if err := validateAnthropicSampling(req); err != nil {
+		return openaip.ChatCompletionRequest{}, err
+	}
 
 	result := openaip.ChatCompletionRequest{
 		Model:    DefaultOpenAIModel,
@@ -79,6 +82,22 @@ func AnthropicRequestToOpenAI(ctx context.Context, req anthropic.MessagesRequest
 	return result, nil
 }
 
+// validateAnthropicSampling rejects sampling parameters outside the ranges the
+// Messages API accepts, so a request that would 400 against the real endpoint does
+// so here rather than being silently passed to a runtime with different bounds.
+func validateAnthropicSampling(req anthropic.MessagesRequest) error {
+	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 1) {
+		return fmt.Errorf("temperature: input should be between 0 and 1")
+	}
+	if req.TopP != nil && (*req.TopP < 0 || *req.TopP > 1) {
+		return fmt.Errorf("top_p: input should be between 0 and 1")
+	}
+	if req.TopK != nil && *req.TopK < 0 {
+		return fmt.Errorf("top_k: input should be greater than or equal to 0")
+	}
+	return nil
+}
+
 // OpenAIResponseToAnthropic converts an upstream chat completion into a Messages
 // API reply. model is the model the client asked for, echoed back the way the
 // real API does.
@@ -105,13 +124,7 @@ func OpenAIResponseToAnthropic(resp openaip.ChatCompletionResponse, model string
 		toolBlocks := openAIToolCallsToAnthropicBlocks(choice.Message.ToolCalls)
 		out.Content = append(out.Content, toolBlocks...)
 
-		reason := OpenAIFinishReasonToAnthropic(choice.FinishReason)
-		// Some runtimes report finish_reason "stop" alongside tool calls. Agent
-		// loops branch on stop_reason to decide whether to run tools and reply with
-		// tool_result, so a message carrying tool_use has to say tool_use.
-		if len(toolBlocks) > 0 {
-			reason = anthropic.StopReasonToolUse
-		}
+		reason := AnthropicStopReason(choice.FinishReason, len(toolBlocks) > 0)
 		if reason != "" {
 			out.StopReason = &reason
 		}
@@ -220,6 +233,29 @@ func OpenAIFinishReasonToAnthropic(reason string) string {
 	}
 }
 
+// AnthropicStopReason resolves the stop_reason for a message, given the upstream
+// finish_reason and whether the message ended up carrying tool_use blocks.
+//
+// Some runtimes report finish_reason "stop", or nothing at all, alongside tool
+// calls. Agent loops branch on stop_reason to decide whether to run tools and
+// reply with tool_result, so a message carrying tool_use has to say tool_use.
+//
+// A "length" finish is left alone: the arguments were cut off mid-generation, and
+// reporting max_tokens is both what the real API does and what stops an agent
+// executing a truncated call.
+func AnthropicStopReason(finishReason string, hasToolUse bool) string {
+	reason := OpenAIFinishReasonToAnthropic(finishReason)
+	if !hasToolUse {
+		return reason
+	}
+	switch reason {
+	case "", anthropic.StopReasonEndTurn:
+		return anthropic.StopReasonToolUse
+	default:
+		return reason
+	}
+}
+
 func anthropicMessageToOpenAIMessages(ctx context.Context, message anthropic.Message, renderer pdf.Renderer) ([]openaip.Message, error) {
 	role := anthropicRoleToOpenAI(message.Role)
 
@@ -304,6 +340,12 @@ func anthropicSourceToOpenAIContentParts(ctx context.Context, block anthropic.Co
 
 	switch source.Type {
 	case anthropic.SourceTypeBase64, "":
+		// Without a media type there is no way to tell an image from a PDF, and the
+		// fallback would quietly forward a description of the bytes as prompt text.
+		// The real endpoint rejects the request, which is the more useful answer.
+		if mediaType == "" {
+			return nil, fmt.Errorf("%s.source.media_type: field required", block.Type)
+		}
 		data, err := base64.StdEncoding.DecodeString(source.Data)
 		if err != nil {
 			return nil, fmt.Errorf("decode %s source: %w", block.Type, err)

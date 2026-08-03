@@ -117,19 +117,20 @@ type anthropicStreamWriter struct {
 	flusher http.Flusher
 	model   string
 
-	started      bool
-	finished     bool
-	sawFrame     bool
-	nextIndex    int
-	textIndex    int
-	pendingTools map[int]*pendingToolCall
-	flushedTools map[int]flushedToolCall
-	toolUseIDs   *toolUseIDs
-	messageID    string
-	stopReason   string
-	inputTokens  int
-	outputTokens int
-	writeErr     error
+	started          bool
+	finished         bool
+	sawFrame         bool
+	nextIndex        int
+	textIndex        int
+	pendingTools     map[int]*pendingToolCall
+	flushedTools     map[int]flushedToolCall
+	toolUseIDs       *toolUseIDs
+	messageID        string
+	finishReason     string
+	emittedToolBlock bool
+	inputTokens      int
+	outputTokens     int
+	writeErr         error
 }
 
 // pendingToolCall accumulates one upstream tool call until it can be emitted.
@@ -158,27 +159,47 @@ func (p *pendingToolCall) midObject() bool {
 type flushedToolCall struct {
 	upstreamID string
 	name       string
+	arguments  string
 }
 
-// echoes reports whether a delta only restates this already-emitted call: it
-// brings no arguments, and no identity that contradicts what was emitted.
+// echoes reports whether a delta only restates this already-emitted call, either
+// by bringing no arguments at all or by repeating the ones it was emitted with,
+// and without contradicting its identity.
 //
-// Upstreams do repeat finished tool calls, whether as a padding delta with empty
-// arguments or by resending the whole tool_calls array in a later chunk. Treating
-// those as new calls fabricates a duplicate invocation, which is worse than
-// dropping them: the client would run a real tool with empty arguments.
+// Upstreams do repeat finished tool calls: as a padding delta with empty
+// arguments, or by resending the whole tool_calls array — arguments included — in
+// a later chunk. Treating those as new calls fabricates a duplicate invocation, so
+// the client runs a real tool twice.
 //
-// A delta that brings arguments, or a different id or name, is not an echo and
-// does start a new call. One that brings nothing at all is indistinguishable from
-// an echo, and is treated as one.
+// A delta bringing different arguments, or a different id or name, is not an echo
+// and does start a new call. One bringing nothing at all is indistinguishable from
+// an echo and is treated as one.
 func (f flushedToolCall) echoes(id, name, arguments string) bool {
-	if strings.TrimSpace(arguments) != "" {
+	if !identityMatches(id, f.upstreamID) || !identityMatches(name, f.name) {
 		return false
 	}
-	if id != "" && id != f.upstreamID {
+	trimmed := strings.TrimSpace(arguments)
+	return trimmed == "" || trimmed == strings.TrimSpace(f.arguments)
+}
+
+// identityMatches reports whether an incoming id or name is consistent with one
+// already recorded. An empty incoming value carries no information, so it matches.
+func identityMatches(incoming, recorded string) bool {
+	return incoming == "" || incoming == recorded
+}
+
+// restates reports whether a delta merely repeats what this pending call already
+// holds, which some upstreams do by resending the whole tool_calls array. Such a
+// delta has to be dropped rather than folded in, or the arguments concatenate with
+// themselves and stop being parseable.
+func (p *pendingToolCall) restates(id, name, arguments string) bool {
+	if p.arguments == "" {
 		return false
 	}
-	return name == "" || name == f.name
+	if !identityMatches(id, p.upstreamID) || !identityMatches(name, p.name) {
+		return false
+	}
+	return strings.TrimSpace(arguments) == strings.TrimSpace(p.arguments)
 }
 
 // startsNewCall reports whether a delta belongs to a different call than the one
@@ -192,20 +213,27 @@ func (f flushedToolCall) echoes(id, name, arguments string) bool {
 //     must belong to different calls. Requiring a *new object* is what keeps a
 //     trailing delta carrying no arguments — a padding delta, or identity that
 //     arrives after the arguments completed — reading as the continuation it is.
-//   - A different id while no arguments have been seen at all. Once arguments are
-//     in flight an id may simply be arriving late, so it says nothing; before
-//     then, two different ids can only be two different calls.
+//   - An unrelated id while no arguments have been seen at all. Once arguments are
+//     in flight an id may simply be arriving late, so it says nothing. "Unrelated"
+//     excludes a prefix relationship, because an upstream that streams an id sends
+//     a prefix first, and splitting there would tear one call in two.
 //
 // Names are deliberately not compared. A name can arrive in fragments, which is
 // indistinguishable from two calls to different tools when neither carries an id.
 func (p *pendingToolCall) startsNewCall(id, arguments string) bool {
 	if p.arguments == "" {
-		return id != "" && p.upstreamID != "" && id != p.upstreamID
+		return id != "" && p.upstreamID != "" && !prefixRelated(id, p.upstreamID)
 	}
 	if p.midObject() {
 		return false
 	}
 	return strings.HasPrefix(strings.TrimSpace(arguments), "{")
+}
+
+// prefixRelated reports whether either string is a prefix of the other, which is
+// what a value arriving in fragments looks like.
+func prefixRelated(a, b string) bool {
+	return strings.HasPrefix(a, b) || strings.HasPrefix(b, a)
 }
 
 // observeName folds a name fragment into the call. Upstreams variously send the
@@ -220,6 +248,19 @@ func (p *pendingToolCall) observeName(name string) {
 	default:
 		p.name += name
 	}
+}
+
+// observeID folds an id into the call. An id that extends the one already held is
+// the same id continuing, which is how an upstream streaming its ids would look;
+// an unrelated id only reaches here once startsNewCall has ruled it a continuation.
+func (p *pendingToolCall) observeID(id string) {
+	if id == "" || id == p.upstreamID {
+		return
+	}
+	if strings.HasPrefix(p.upstreamID, id) {
+		return
+	}
+	p.upstreamID = id
 }
 
 func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStreamWriter {
@@ -274,8 +315,8 @@ func (a *anthropicStreamWriter) consume(dataLines []string) error {
 		for _, call := range choice.Delta.ToolCalls {
 			a.writeToolCallDelta(call)
 		}
-		if reason := OpenAIFinishReasonToAnthropic(choice.FinishReason); reason != "" {
-			a.stopReason = reason
+		if choice.FinishReason != "" {
+			a.finishReason = choice.FinishReason
 		}
 	}
 
@@ -361,9 +402,12 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 		name = call.Function.Name
 	}
 
-	// A delta that only restates a call already emitted at this index is an echo,
-	// not a new call. Checked before any flushing, so an echo cannot end the calls
-	// below it either.
+	// A delta that only restates the call at this index changes nothing, whether
+	// that call is still pending or has already been emitted. Both are checked
+	// before any flushing, so a restatement cannot end the calls below it either.
+	if pending, ok := a.pendingTools[call.Index]; ok && pending.restates(call.ID, name, arguments) {
+		return
+	}
 	if flushed, ok := a.flushedTools[call.Index]; ok && flushed.echoes(call.ID, name, arguments) {
 		return
 	}
@@ -383,9 +427,7 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 		a.pendingTools[call.Index] = pending
 	}
 
-	if call.ID != "" {
-		pending.upstreamID = call.ID
-	}
+	pending.observeID(call.ID)
 	if call.Function != nil {
 		pending.observeName(name)
 		pending.arguments += arguments
@@ -448,6 +490,7 @@ func (a *anthropicStreamWriter) flushToolCall(upstreamIndex int) {
 	a.flushedTools[upstreamIndex] = flushedToolCall{
 		upstreamID: pending.upstreamID,
 		name:       pending.name,
+		arguments:  pending.arguments,
 	}
 
 	// A tool call upstream never named cannot be invoked, and the Messages API
@@ -464,6 +507,7 @@ func (a *anthropicStreamWriter) flushToolCall(upstreamIndex int) {
 	// handed to the client holding input it cannot decode.
 	input := string(anthropicToolInput(pending.arguments))
 
+	a.emittedToolBlock = true
 	index := a.startBlock(anthropic.ToolUseStreamBlock(
 		a.toolUseIDs.assign(pending.upstreamID, pending.name),
 		pending.name,
@@ -536,7 +580,9 @@ func (a *anthropicStreamWriter) finish() error {
 	}
 	a.closeTextBlock()
 
-	stopReason := a.stopReason
+	// Resolved the same way as the non-streaming path, so the two agree: a message
+	// carrying tool_use says tool_use even when upstream reported "stop".
+	stopReason := AnthropicStopReason(a.finishReason, a.emittedToolBlock)
 	if stopReason == "" {
 		stopReason = anthropic.StopReasonEndTurn
 	}

@@ -232,6 +232,39 @@ func TestAnthropicRequestToOpenAIRejectsNonPositiveMaxTokens(t *testing.T) {
 	}
 }
 
+func TestAnthropicRequestToOpenAIRejectsOutOfRangeSampling(t *testing.T) {
+	cases := map[string]string{
+		"temperature_above_one": `"temperature":1.5`,
+		"temperature_negative":  `"temperature":-0.1`,
+		"top_p_above_one":       `"top_p":2`,
+		"top_k_negative":        `"top_k":-1`,
+	}
+
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := decodeAnthropicRequest(t, `{"max_tokens":16,`+field+`,"messages":[{"role":"user","content":"hi"}]}`)
+
+			if _, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer()); err == nil {
+				t.Fatalf("expected an error for %s", field)
+			}
+		})
+	}
+}
+
+func TestAnthropicRequestToOpenAIAcceptsRangeBoundaries(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 16,
+		"temperature": 1,
+		"top_p": 0,
+		"top_k": 0,
+		"messages": [{"role": "user", "content": "hi"}]
+	}`)
+
+	if _, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer()); err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error at the range boundaries: %v", err)
+	}
+}
+
 // A tool_result answers the assistant message that requested it, so it must come
 // before any other content in the same turn. The SDK's tool-use loop emits a user
 // turn shaped exactly like this.
@@ -443,6 +476,14 @@ func TestAnthropicRequestToOpenAISourceErrors(t *testing.T) {
 			name: "unsupported_source_type",
 			body: `{"max_tokens":16,"messages":[{"role":"user","content":[
 				{"type":"image","source":{"type":"file_id","media_type":"image/png"}}
+			]}]}`,
+		},
+		{
+			// Without a media type an image cannot be told from a PDF, and the
+			// fallback would forward a description of the bytes as prompt text.
+			name: "base64_without_media_type",
+			body: `{"max_tokens":16,"messages":[{"role":"user","content":[
+				{"type":"image","source":{"type":"base64","data":"aGk="}}
 			]}]}`,
 		},
 	}
@@ -668,11 +709,21 @@ func TestOpenAIResponseToAnthropicToolCalls(t *testing.T) {
 	}
 }
 
-// Some runtimes report finish_reason "stop" alongside tool calls. Agent loops
-// branch on stop_reason to decide whether to run tools, so a message carrying
-// tool_use has to say tool_use however upstream labelled it.
+// Some runtimes report finish_reason "stop", or nothing, alongside tool calls.
+// Agent loops branch on stop_reason to decide whether to run tools, so a message
+// carrying tool_use has to say tool_use. A "length" finish is the exception: the
+// arguments were cut off, and reporting max_tokens is both what the real API does
+// and what stops an agent executing a truncated call.
 func TestOpenAIResponseToAnthropicStopReasonWithToolCalls(t *testing.T) {
-	for _, finishReason := range []string{"stop", "", "length", "content_filter", "tool_calls"} {
+	cases := map[string]string{
+		"stop":           anthropic.StopReasonToolUse,
+		"":               anthropic.StopReasonToolUse,
+		"content_filter": anthropic.StopReasonToolUse,
+		"tool_calls":     anthropic.StopReasonToolUse,
+		"length":         anthropic.StopReasonMaxTokens,
+	}
+
+	for finishReason, want := range cases {
 		t.Run("finish_reason="+finishReason, func(t *testing.T) {
 			resp := openaip.ChatCompletionResponse{
 				Choices: []openaip.Choice{{
@@ -692,10 +743,65 @@ func TestOpenAIResponseToAnthropicStopReasonWithToolCalls(t *testing.T) {
 			if got.StopReason == nil {
 				t.Fatal("stop_reason is null on a message carrying tool_use")
 			}
-			if *got.StopReason != anthropic.StopReasonToolUse {
-				t.Fatalf("stop_reason = %q, want tool_use", *got.StopReason)
+			if *got.StopReason != want {
+				t.Fatalf("stop_reason = %q, want %q", *got.StopReason, want)
 			}
 		})
+	}
+}
+
+// The streaming path has to resolve stop_reason the same way, since that is the
+// path agent SDKs actually use.
+func TestWriteAnthropicStreamStopReasonMatchesNonStreaming(t *testing.T) {
+	cases := map[string]string{
+		"stop":       anthropic.StopReasonToolUse,
+		"tool_calls": anthropic.StopReasonToolUse,
+		"length":     anthropic.StopReasonMaxTokens,
+	}
+
+	for finishReason, want := range cases {
+		t.Run("finish_reason="+finishReason, func(t *testing.T) {
+			upstream := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}}]}` + "\n\n" +
+				`data: {"choices":[{"delta":{},"finish_reason":"` + finishReason + `"}]}` + "\n\n" +
+				"data: [DONE]\n\n"
+
+			events, _ := writeAnthropicStream(t, upstream, "")
+
+			var got string
+			for _, event := range events {
+				if event.name != anthropic.EventMessageDelta {
+					continue
+				}
+				decoded := decodeEvent(t, event)
+				if decoded.Delta == nil || decoded.Delta.StopReason == nil {
+					t.Fatalf("message_delta has no stop_reason: %s", event.data)
+				}
+				got = *decoded.Delta.StopReason
+			}
+
+			if got != want {
+				t.Fatalf("stop_reason = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A streamed message with no tool calls keeps the plain mapping.
+func TestWriteAnthropicStreamStopReasonWithoutToolCalls(t *testing.T) {
+	upstream := `data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	events, _ := writeAnthropicStream(t, upstream, "")
+
+	for _, event := range events {
+		if event.name != anthropic.EventMessageDelta {
+			continue
+		}
+		decoded := decodeEvent(t, event)
+		if *decoded.Delta.StopReason != anthropic.StopReasonEndTurn {
+			t.Fatalf("stop_reason = %q, want end_turn", *decoded.Delta.StopReason)
+		}
 	}
 }
 

@@ -81,6 +81,12 @@ func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		anthropic.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid count_tokens request: %v", err))
 		return
 	}
+	// count_tokens has no max_tokens requirement, since it measures a prompt rather
+	// than running one, but it does need something to measure.
+	if len(req.Messages) == 0 {
+		anthropic.WriteError(w, http.StatusBadRequest, "messages: at least one message is required")
+		return
+	}
 
 	count, upstreamStatus, upstreamBody, upstreamErr := s.countUpstreamTokens(r, translate.CountTokensTextFromAnthropic(req))
 	if upstreamErr != nil {
