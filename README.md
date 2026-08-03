@@ -7,11 +7,11 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/harshaneel/localaik)](https://github.com/harshaneel/localaik/blob/main/go.mod)
 [![Go Reference](https://pkg.go.dev/badge/github.com/harshaneel/localaik.svg)](https://pkg.go.dev/github.com/harshaneel/localaik)
 
-A local compatibility server for the Gemini and OpenAI APIs. Run one container, point your SDK at `http://localhost:8090`, and get both protocol shapes on the same port for tests and development.
+A local compatibility server for the Gemini, OpenAI, and Anthropic APIs. Run one container, point your SDK at `http://localhost:8090`, and get all three protocol shapes on the same port for tests and development.
 
 ## Motivation
 
-Testing code that calls Gemini or OpenAI is painful: real API calls are slow, cost money, and need network access. localaik gives you a single Docker container that speaks both protocols backed by a local model — no API key, no internet, deterministic enough for CI.
+Testing code that calls Gemini, OpenAI, or Anthropic is painful: real API calls are slow, cost money, and need network access. localaik gives you a single Docker container that speaks all three protocols backed by a local model — no API key, no internet, deterministic enough for CI.
 
 ## Architecture
 
@@ -22,8 +22,9 @@ Testing code that calls Gemini or OpenAI is painful: real API calls are slow, co
 │  ┌──────────────────────────┐    ┌──────────────────┐  │
 │  │  localaik proxy (:8090)  │    │ llama.cpp (:8080)│  │
 │  │                          │    │                  │  │
-│  │  /v1beta/* (Gemini)  ────┼──▶ │  Gemma 3 model   │  │
-│  │  /v1/*     (OpenAI)  ────┼──▶ │                  │  │
+│  │  /v1beta/*    (Gemini)  ─┼──▶ │  Gemma 3 model   │  │
+│  │  /v1/*        (OpenAI)  ─┼──▶ │                  │  │
+│  │  /v1/messages (Anthropic)┼──▶ │                  │  │
 │  │                          │    └──────────────────┘  │
 │  │                          │                          │
 │  │                          │    ┌──────────────────┐  │
@@ -33,7 +34,7 @@ Testing code that calls Gemini or OpenAI is painful: real API calls are slow, co
 └────────────────────────────────────────────────────────┘
 ```
 
-SDK requests hit the localaik proxy, which translates Gemini or OpenAI wire format and forwards to the local llama.cpp server running a Gemma 3 model.
+SDK requests hit the localaik proxy, which translates Gemini, OpenAI, or Anthropic wire format and forwards to the local llama.cpp server running a Gemma 3 model.
 
 ## Quick start
 
@@ -101,6 +102,29 @@ client := openai.NewClient(
     option.WithBaseURL("http://localhost:8090/v1"),
 )
 ```
+
+### Anthropic SDK
+
+The Anthropic SDKs append `v1/` themselves, so the base URL is the bare host.
+
+**Python:**
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(api_key="test", base_url="http://localhost:8090")
+```
+
+**Go:**
+
+```go
+client := anthropic.NewClient(
+    option.WithAPIKey("test"),
+    option.WithBaseURL("http://localhost:8090/"),
+)
+```
+
+`max_tokens` is required by the Messages API, so localaik rejects requests without it exactly as the real endpoint does.
 
 ## Docker tags
 
@@ -172,10 +196,21 @@ services:
 | `POST /v1/completions`                              | OpenAI legacy completions      | Forwarded to upstream                   |
 | `GET /v1/models`                                    | OpenAI `Models.List`           | Forwarded to upstream                   |
 | `GET /v1/models/{model}`                            | OpenAI `Models.Retrieve`       | Forwarded to upstream                   |
+| `POST /v1/messages`                                 | Anthropic `Messages.New`       | Translated to upstream chat completions |
+| `POST /v1/messages/count_tokens`                    | Anthropic `Messages.CountTokens` | Translated to upstream `/tokenize`    |
 | `GET /health`                                       | Health checks                  | Custom route                            |
 
+`POST /v1/messages` streams when the request body sets `"stream": true`, matching
+how the Anthropic SDKs signal streaming (there is no separate route).
 
-All other API routes return `404`.
+
+All other API routes return `404`, in the error shape of whichever protocol owns
+the path prefix.
+
+Note that `/v1/` is shared: `GET /v1/models` is served as the OpenAI models list,
+so an Anthropic client calling `client.models.list()` gets OpenAI-shaped data
+rather than a `404`. Only `/v1/messages` and `/v1/messages/count_tokens` are
+handled as Anthropic.
 
 ## Tested SDKs
 
@@ -183,6 +218,7 @@ Automated contract tests validate against:
 
 - `google.golang.org/genai` v1.57.0
 - `github.com/openai/openai-go/v3` v3.36.0
+- `github.com/anthropics/anthropic-sdk-go` v1.61.0
 
 Other SDK versions and languages may work if they emit the same HTTP shapes.
 
@@ -210,6 +246,7 @@ jobs:
         env:
           GOOGLE_GEMINI_BASE_URL: http://localhost:8090
           OPENAI_BASE_URL: http://localhost:8090/v1
+          ANTHROPIC_BASE_URL: http://localhost:8090
 ```
 
 ## Gemini compatibility
@@ -243,6 +280,51 @@ jobs:
 **Supported:** text chat completions, legacy `/v1/completions`, `Models.List` / `Models.Retrieve`, structured output, vision inputs, tool-related fields (all passed through to upstream).
 
 **Not supported:** Responses API, Assistants, Embeddings, Images, Audio, Files, Vector stores.
+
+## Anthropic compatibility
+
+**Supported features:**
+
+- `Messages.New` and `Messages.CountTokens`
+- `content` as a bare string or an array of blocks, in messages and in `system`
+- `text`, `image`, and `document` blocks; base64 PDFs are auto-converted to page images
+- `image` blocks with a `url` source (the URL is passed to upstream as-is)
+- `tool_use` and `tool_result` blocks, including `is_error`
+- Tool definitions via `tools`, constrained via `tool_choice` (`auto`, `any`, `tool`, `none`)
+- `max_tokens` (required, and rejected below 1), `temperature`, `top_p`, `top_k`, `stop_sequences`
+- Streaming via `"stream": true`, emitted as the full Anthropic event sequence
+  (`message_start`, `content_block_start` / `content_block_delta` / `content_block_stop`,
+  `message_delta`, `message_stop`) so the SDK's own accumulator works unmodified
+- `x-api-key` and `anthropic-version` headers accepted and ignored
+- Anthropic-shaped error bodies (`{"type":"error","error":{...}}`) with the status-appropriate error type
+
+**Known differences from the real API:**
+
+| Behavior | localaik |
+| --- | --- |
+| `stop_reason: "stop_sequence"` | Never emitted. The upstream runtime reports plain `stop` for both a natural end of turn and a stop-sequence hit, so those come back as `end_turn`. |
+| `count_tokens` on multimodal input | Counts text only, including text-source `document` blocks. Images, base64 documents, and tool blocks are skipped, so counts run lower than the real API. |
+| Streamed tool arguments | Text streams token by token, but a tool call's arguments arrive in a single `input_json_delta` rather than several. Tool calls are accumulated per OpenAI's `tool_calls[].index` and emitted whole at the end of the stream. SDK accumulators build the same result either way. |
+| `tool_use` ids when upstream sends none | Synthesized from the tool name, with a numeric suffix when that would collide. Two parallel calls to one tool would otherwise share an id, and the client's `tool_result` blocks key on it. |
+| A tool call upstream never named | Dropped, since the Messages API never emits a `tool_use` without a name and no client can invoke one. If that leaves no tool calls at all, `stop_reason` is `end_turn` rather than `tool_use`. |
+| A tool call upstream restates verbatim | Ignored once its arguments are a whole object, since gateways resend the entire `tool_calls` array on a later chunk. A repeat of a partial fragment is treated as a continuation, because that is indistinguishable from one. |
+| Text interleaved into a tool call's arguments | Not something OpenAI's contract produces. A call whose arguments are mid-object is held back, so nothing is lost, but the blocks come out in a different order than upstream sent them. A call whose first chunk carried `"arguments": ""` is not distinguishable from a finished no-argument call, so text arriving there ends it early and any arguments that follow start a second block. |
+| Two different tool calls sharing one `tool_calls[].index` | Merged, because the index is what identifies a call. OpenAI's contract does not allow this, and every attempt to infer a split from ids, names or argument shapes broke a well-formed stream instead. Their concatenated arguments stop parsing, so the block ends up with `{}`. |
+| Streamed `usage` | Only as good as what upstream reports; the counts are zero when the runtime omits usage from streamed responses. |
+| A stream that ends without a `finish_reason` | Closed out as `end_turn` rather than reported as an error, so a runtime that omits the field still produces a usable response. A truncated upstream stream therefore looks complete. A `200` carrying no stream frames at all is reported as an error rather than an empty message. |
+| Anthropic's built-in tools in `tools` (web search, code execution, computer use, text editor, bash) | Skipped, along with `tool_choice` if nothing else remains. They are declared by a versioned `type` with no `input_schema`, so there is nothing to describe to the local model, and offering them would invite calls that go nowhere. |
+| `tool_use` / `tool_result` with the ids omitted | Not re-paired. Both ids are required by the Messages API; when they are absent there is nothing to match on, so each side gets a placeholder instead. |
+| Multiple upstream choices while streaming | The stream follows the lowest choice index; the rest are dropped. |
+| `thinking` / `redacted_thinking` blocks in request history | Accepted and dropped rather than replayed into the prompt. |
+| Multiple candidates | Only the first upstream choice becomes the message; the Messages API returns one message. |
+| `document` blocks with a `url` source | Summarised as text; localaik does not fetch remote documents. |
+
+**Not supported:**
+
+- Message Batches, Files, Models list/get on the Anthropic paths
+- Extended thinking (`thinking` is accepted and ignored), citations, prompt caching
+- Server tools (web search, web fetch, code execution, computer use, text editor)
+- Beta endpoints under `/v1/beta/`
 
 ## Development
 

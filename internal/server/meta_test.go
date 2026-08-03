@@ -319,12 +319,15 @@ func TestServerPassthroughStripsAuthHeaders(t *testing.T) {
 		{"openai_models_list", http.MethodGet, "/v1/models"},
 		{"openai_model_get", http.MethodGet, "/v1/models/gemma-3-4b"},
 	}
+	// The Anthropic routes are not passthrough; they build a fresh upstream
+	// request, and are covered by TestServerAnthropicDoesNotForwardCredentials.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var seenAuth, seenGoogKey string
+			var seenAuth, seenGoogKey, seenAPIKey string
 			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				seenAuth = r.Header.Get("Authorization")
 				seenGoogKey = r.Header.Get("X-Goog-Api-Key")
+				seenAPIKey = r.Header.Get("X-Api-Key")
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{}`))
 			})
@@ -337,6 +340,7 @@ func TestServerPassthroughStripsAuthHeaders(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, body)
 			req.Header.Set("Authorization", "Bearer secret")
 			req.Header.Set("X-Goog-Api-Key", "secret-key")
+			req.Header.Set("X-Api-Key", "secret-anthropic-key")
 			rec := httptest.NewRecorder()
 			srv.ServeHTTP(rec, req)
 
@@ -345,6 +349,9 @@ func TestServerPassthroughStripsAuthHeaders(t *testing.T) {
 			}
 			if seenGoogKey != "" {
 				t.Fatalf("X-Goog-Api-Key leaked upstream: %q", seenGoogKey)
+			}
+			if seenAPIKey != "" {
+				t.Fatalf("X-Api-Key leaked upstream: %q", seenAPIKey)
 			}
 		})
 	}

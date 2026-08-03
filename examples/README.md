@@ -23,17 +23,17 @@ Small, runnable samples that talk to **localaik** on `http://localhost:8090`. Us
 
 ## Layout
 
-| Language    | Gemini | OpenAI | Structured output (Gemini) |
-| ----------- | ------ | ------ | --------------------------- |
-| **curl**    | [curl/gemini.sh](curl/gemini.sh) | [curl/openai.sh](curl/openai.sh) | [curl/gemini-structured.sh](curl/gemini-structured.sh) |
-| **Go**      | [go/gemini](go/gemini/main.go) | [go/openai](go/openai/main.go) | [go/gemini-structured](go/gemini-structured/main.go) |
-| **Python**  | [python/gemini](python/gemini/main.py) | [python/openai](python/openai/main.py) | [python/gemini-structured](python/gemini-structured/main.py) |
-| **JavaScript** | [javascript/gemini](javascript/gemini/index.mjs) | [javascript/openai](javascript/openai/index.mjs) | [javascript/gemini-structured](javascript/gemini-structured/index.mjs) |
-| **Java**    | [java/gemini](java/gemini/Gemini.java) | [java/openai](java/openai/OpenAI.java) | [java/gemini-structured](java/gemini-structured/GeminiStructured.java) |
+| Language    | Gemini | OpenAI | Anthropic | Structured output (Gemini) |
+| ----------- | ------ | ------ | --------- | --------------------------- |
+| **curl**    | [curl/gemini.sh](curl/gemini.sh) | [curl/openai.sh](curl/openai.sh) | [curl/anthropic.sh](curl/anthropic.sh) | [curl/gemini-structured.sh](curl/gemini-structured.sh) |
+| **Go**      | [go/gemini](go/gemini/main.go) | [go/openai](go/openai/main.go) | [go/anthropic](go/anthropic/main.go) | [go/gemini-structured](go/gemini-structured/main.go) |
+| **Python**  | [python/gemini](python/gemini/main.py) | [python/openai](python/openai/main.py) | not yet | [python/gemini-structured](python/gemini-structured/main.py) |
+| **JavaScript** | [javascript/gemini](javascript/gemini/index.mjs) | [javascript/openai](javascript/openai/index.mjs) | not yet | [javascript/gemini-structured](javascript/gemini-structured/index.mjs) |
+| **Java**    | [java/gemini](java/gemini/Gemini.java) | [java/openai](java/openai/OpenAI.java) | not yet | [java/gemini-structured](java/gemini-structured/GeminiStructured.java) |
 
 ## Conventions
 
-- **Base URL:** `http://localhost:8090` for Gemini-style calls; OpenAI clients use `http://localhost:8090/v1`.
+- **Base URL:** `http://localhost:8090` for Gemini-style calls; OpenAI clients use `http://localhost:8090/v1`; Anthropic clients use `http://localhost:8090` (their SDKs append `v1/` themselves).
 - **API key:** Examples use a placeholder such as `test` where the SDK requires one; localaik does not validate keys.
 - **Model name:** Samples use `localaik` as the model id where applicable; the proxy forwards to the bundled upstream model.
 
