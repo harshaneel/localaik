@@ -215,9 +215,16 @@ func OpenAIFinishReasonToAnthropic(reason string) string {
 // max_tokens because the arguments were truncated.
 func AnthropicStopReason(finishReason string, hasToolUse bool) string {
 	reason := OpenAIFinishReasonToAnthropic(finishReason)
+
 	if !hasToolUse {
+		// Without tool_use blocks there is nothing for a client to answer, whatever
+		// upstream reported.
+		if reason == anthropic.StopReasonToolUse {
+			return anthropic.StopReasonEndTurn
+		}
 		return reason
 	}
+
 	switch reason {
 	case "", anthropic.StopReasonEndTurn:
 		return anthropic.StopReasonToolUse

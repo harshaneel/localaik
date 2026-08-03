@@ -750,6 +750,32 @@ func TestOpenAIResponseToAnthropicStopReasonWithToolCalls(t *testing.T) {
 	}
 }
 
+// Upstream can report tool_calls while every call it sent gets dropped. Nothing is
+// then left for a client to answer, so the message must not claim tool_use.
+func TestOpenAIResponseToAnthropicStopReasonWithoutToolBlocks(t *testing.T) {
+	resp := openaip.ChatCompletionResponse{
+		Choices: []openaip.Choice{{
+			Message: openaip.Message{
+				Content: "text only",
+				ToolCalls: []openaip.ToolCall{{
+					ID:       "toolu_1",
+					Function: &openaip.ToolCallFunction{Name: "", Arguments: `{}`},
+				}},
+			},
+			FinishReason: "tool_calls",
+		}},
+	}
+
+	got := OpenAIResponseToAnthropic(resp, "")
+
+	if len(got.Content) != 1 || got.Content[0].Type != anthropic.BlockTypeText {
+		t.Fatalf("content = %#v, want only the text block", got.Content)
+	}
+	if got.StopReason == nil || *got.StopReason != anthropic.StopReasonEndTurn {
+		t.Fatalf("stop_reason = %v, want end_turn when no tool_use survived", got.StopReason)
+	}
+}
+
 // The streaming path has to resolve stop_reason the same way, since that is the
 // path agent SDKs actually use.
 func TestWriteAnthropicStreamStopReasonMatchesNonStreaming(t *testing.T) {

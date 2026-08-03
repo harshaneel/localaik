@@ -827,6 +827,104 @@ func TestWriteAnthropicStreamEchoesOfFlushedToolCalls(t *testing.T) {
 	}
 }
 
+// A fragment can legitimately equal everything accumulated so far, whenever the
+// arguments contain a doubled prefix and the cuts fall either side of it. Treating
+// that as a restatement drops it and the call loses its arguments entirely.
+func TestWriteAnthropicStreamRepeatedFragmentIsNotARestatement(t *testing.T) {
+	cases := map[string][]string{
+		`{"data":{"data":1}}`: {`{"data":`, `{"data":`, `1}}`},
+		`{"a":{"a":1}}`:       {`{"a":`, `{"a":`, `1}}`},
+		`{"x":"{\"x\":"}`:     {`{"x":"{\"x\":`, `"}`},
+	}
+
+	for want, fragments := range cases {
+		t.Run(want, func(t *testing.T) {
+			chunks := []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":` + mustJSONString(t, fragments[0]) + `}}]}}]}`,
+			}
+			for _, fragment := range fragments[1:] {
+				chunks = append(chunks, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":`+mustJSONString(t, fragment)+`}}]}}]}`)
+			}
+			chunks = append(chunks, `data: [DONE]`, ``)
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, strings.Join(chunks, "\n\n")))
+
+			if len(blocks) != 1 {
+				t.Fatalf("blocks = %#v, want one call", blocks)
+			}
+			if blocks[0].input != want {
+				t.Fatalf("input = %q, want %q", blocks[0].input, want)
+			}
+		})
+	}
+}
+
+// A verbatim resend after the call was already emitted must not become a second
+// block: the client would invoke the tool twice.
+func TestWriteAnthropicStreamVerbatimResendAfterFlush(t *testing.T) {
+	firstCall := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`
+
+	cases := map[string][]string{
+		"after_text": {
+			firstCall,
+			`data: {"choices":[{"delta":{"content":"done"}}]}`,
+			firstCall,
+		},
+		"riding_the_text_chunk": {
+			firstCall,
+			`data: {"choices":[{"delta":{"content":"done","tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
+		},
+	}
+
+	for name, chunks := range cases {
+		t.Run(name, func(t *testing.T) {
+			upstream := strings.Join(append(chunks, `data: [DONE]`, ``), "\n\n")
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+			if len(blocks) != 1 {
+				t.Fatalf("blocks = %#v, want one call", blocks)
+			}
+			if blocks[0].id != "c0" || blocks[0].name != "first" || blocks[0].input != `{"a":1}` {
+				t.Fatalf("block = %#v", blocks[0])
+			}
+		})
+	}
+}
+
+// Text arriving between a call's argument fragments must not discard the rest of
+// them.
+func TestWriteAnthropicStreamTextBetweenArgumentFragments(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":"{\"a\":"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"content":"hmm"}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %#v, want one call", blocks)
+	}
+	if blocks[0].input != `{"a":1}` {
+		t.Fatalf("input = %q, want the arguments preserved across the text", blocks[0].input)
+	}
+}
+
+func mustJSONString(t *testing.T, s string) string {
+	t.Helper()
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("encode %q: %v", s, err)
+	}
+	return string(encoded)
+}
+
 // Two parallel calls to the same tool with no upstream ids must not share an id:
 // the client's tool_result blocks key on it.
 func TestWriteAnthropicStreamDeduplicatesSynthesizedToolIDs(t *testing.T) {

@@ -14,8 +14,8 @@ import (
 )
 
 // WriteAnthropicStreamFromOpenAISSE translates an upstream OpenAI SSE stream into
-// the Anthropic Messages event stream. See specs/design.md for the event sequence
-// and the tool-call accumulation rules.
+// the Anthropic Messages event stream. The README's Anthropic compatibility
+// section documents where this deviates from the real API.
 func WriteAnthropicStreamFromOpenAISSE(w http.ResponseWriter, body io.Reader, model string) error {
 	writer := newAnthropicStreamWriter(w, model)
 	writer.writeHeaders()
@@ -69,34 +69,9 @@ func WriteAnthropicStreamFromOpenAISSE(w http.ResponseWriter, body io.Reader, mo
 	return writer.finish()
 }
 
-// anthropicStreamWriter tracks the block bookkeeping the Anthropic event
-// sequence requires. Block indices start at 0 and increase by exactly one per
-// block, which the SDK accumulators enforce on content_block_start.
-//
-// Text streams through as it arrives. Tool calls are accumulated and emitted at
-// the end of the stream, each as a complete unit: content_block_start / one
-// input_json_delta / content_block_stop.
-//
-// Accumulation follows OpenAI's streaming contract exactly, which is what every
-// OpenAI client does: `tool_calls[].index` identifies the call, `arguments`
-// fragments concatenate in arrival order, and `id`/`name` are sent once. An
-// upstream that omits the index means index 0, so all its fragments belong to one
-// call. "Two different calls at one index" is not something the contract permits,
-// and trying to infer it from ids, names or argument shapes is what earlier
-// versions of this file did — every such heuristic ended up splitting a call that
-// was streaming normally, or merging two that were not.
-//
-// The one concession to non-conforming upstreams is dropping an exact restatement
-// of a call already held, since gateways do resend the whole tool_calls array on a
-// later chunk. Concatenating a call's arguments with themselves would leave the
-// block unparseable, and the repeat carries no information either way.
-//
-// Deferring to end-of-stream also means a block is never stopped holding a
-// half-written fragment, which is what the SDK accumulators fail to marshal.
-//
-// The cost is that a tool call's arguments reach the client in one
-// input_json_delta rather than several. The SDK accumulators build the same result
-// either way.
+// anthropicStreamWriter holds the state one stream needs. Text streams through as
+// it arrives; tool calls accumulate per OpenAI's tool_calls[].index and are
+// emitted whole at the end.
 type anthropicStreamWriter struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
@@ -108,7 +83,7 @@ type anthropicStreamWriter struct {
 	nextIndex        int
 	textIndex        int
 	pendingTools     map[int]*pendingToolCall
-	flushedTools     map[int]bool
+	flushedTools     map[int]*pendingToolCall
 	toolUseIDs       *toolUseIDs
 	messageID        string
 	finishReason     string
@@ -127,13 +102,24 @@ type pendingToolCall struct {
 	arguments  string
 }
 
-// restates reports whether a delta repeats what this call already holds.
+// restates reports whether a delta repeats what this call already holds. Only a
+// whole object can be restated: a fragment equal to an incomplete accumulation is
+// a legitimate continuation, which arguments like {"a":{"a":1}} produce.
 func (p *pendingToolCall) restates(id, name, arguments string) bool {
 	if !identityMatches(id, p.upstreamID) || !identityMatches(name, p.name) {
 		return false
 	}
 	trimmed := strings.TrimSpace(arguments)
-	return trimmed != "" && trimmed == strings.TrimSpace(p.arguments)
+	if trimmed == "" || trimmed != strings.TrimSpace(p.arguments) {
+		return false
+	}
+	return isJSONObject(p.arguments)
+}
+
+// midObject reports whether the arguments so far are an unfinished JSON object,
+// meaning more fragments are still coming.
+func (p *pendingToolCall) midObject() bool {
+	return p.arguments != "" && !isJSONObject(p.arguments)
 }
 
 // identityMatches treats an empty incoming value as consistent with any recorded one.
@@ -159,7 +145,7 @@ func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStr
 		model:        model,
 		textIndex:    -1,
 		pendingTools: make(map[int]*pendingToolCall),
-		flushedTools: make(map[int]bool),
+		flushedTools: make(map[int]*pendingToolCall),
 		toolUseIDs:   newToolUseIDs(),
 	}
 }
@@ -256,7 +242,7 @@ func (a *anthropicStreamWriter) ensureStarted() {
 }
 
 func (a *anthropicStreamWriter) writeTextDelta(text string) {
-	a.flushToolCalls()
+	a.flushCompleteToolCalls()
 
 	if a.textIndex == -1 {
 		a.textIndex = a.startBlock(anthropic.TextStreamBlock())
@@ -283,9 +269,12 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 		name = call.Function.Name
 	}
 
-	// A delta with no arguments for a call already emitted adds nothing.
-	if a.flushedTools[call.Index] && strings.TrimSpace(arguments) == "" {
-		return
+	// A delta that adds nothing to a call already emitted must not become a second
+	// one, or the client invokes the tool twice.
+	if flushed, ok := a.flushedTools[call.Index]; ok {
+		if strings.TrimSpace(arguments) == "" || flushed.restates(call.ID, name, arguments) {
+			return
+		}
 	}
 
 	pending, ok := a.pendingTools[call.Index]
@@ -313,6 +302,19 @@ func (a *anthropicStreamWriter) flushToolCalls() {
 	}
 }
 
+// flushCompleteToolCalls emits calls that are not mid-object, stopping at the first
+// that is. Called when text arrives, which puts the blocks in upstream's order
+// without discarding a call whose arguments are still coming.
+func (a *anthropicStreamWriter) flushCompleteToolCalls() {
+	for {
+		index, ok := a.lowestPendingToolIndex()
+		if !ok || a.pendingTools[index].midObject() {
+			return
+		}
+		a.flushToolCall(index)
+	}
+}
+
 func (a *anthropicStreamWriter) lowestPendingToolIndex() (int, bool) {
 	lowest := 0
 	found := false
@@ -332,7 +334,7 @@ func (a *anthropicStreamWriter) flushToolCall(upstreamIndex int) {
 		return
 	}
 	delete(a.pendingTools, upstreamIndex)
-	a.flushedTools[upstreamIndex] = true
+	a.flushedTools[upstreamIndex] = pending
 
 	// A nameless tool call cannot be invoked; see the README's known differences.
 	if pending.name == "" {
