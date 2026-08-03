@@ -319,6 +319,8 @@ func TestServerPassthroughStripsAuthHeaders(t *testing.T) {
 		{"openai_models_list", http.MethodGet, "/v1/models"},
 		{"openai_model_get", http.MethodGet, "/v1/models/gemma-3-4b"},
 	}
+	// The Anthropic routes are not passthrough; they build a fresh upstream
+	// request, and are covered by TestServerAnthropicDoesNotForwardCredentials.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var seenAuth, seenGoogKey, seenAPIKey string

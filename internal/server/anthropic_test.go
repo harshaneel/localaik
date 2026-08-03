@@ -346,34 +346,65 @@ func TestServerAnthropicRoutingErrors(t *testing.T) {
 	}
 }
 
-func TestServerAnthropicMessagesDoesNotForwardAPIKey(t *testing.T) {
-	var seenAPIKey, seenAuth string
+// Both Anthropic routes must reach upstream without carrying the client's
+// credentials. Each case asserts a 200 so the check cannot pass just because
+// upstream was never called.
+func TestServerAnthropicDoesNotForwardCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{"messages", "/v1/messages", `{"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`},
+		{"count_tokens", "/v1/messages/count_tokens", `{"messages":[{"role":"user","content":"hi"}]}`},
+	}
 
-	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenAPIKey = r.Header.Get("X-Api-Key")
-		seenAuth = r.Header.Get("Authorization")
-		writeJSON(w, http.StatusOK, openaip.ChatCompletionResponse{
-			Choices: []openaip.Choice{{Message: openaip.Message{Content: "ok"}, FinishReason: "stop"}},
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var called bool
+			var seenAPIKey, seenAuth, seenGoogKey string
+
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				seenAPIKey = r.Header.Get("X-Api-Key")
+				seenAuth = r.Header.Get("Authorization")
+				seenGoogKey = r.Header.Get("X-Goog-Api-Key")
+
+				if r.URL.Path == "/tokenize" {
+					writeJSON(w, http.StatusOK, map[string]any{"tokens": []int{1}})
+					return
+				}
+				writeJSON(w, http.StatusOK, openaip.ChatCompletionResponse{
+					Choices: []openaip.Choice{{Message: openaip.Message{Content: "ok"}, FinishReason: "stop"}},
+				})
+			})
+
+			srv := newTestServer(t, upstream)
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewBufferString(tc.body))
+			req.Header.Set("X-Api-Key", "sk-ant-secret")
+			req.Header.Set("Authorization", "Bearer secret")
+			req.Header.Set("X-Goog-Api-Key", "goog-secret")
+			rec := httptest.NewRecorder()
+
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if !called {
+				t.Fatal("upstream was never called, so the header check proves nothing")
+			}
+			if seenAPIKey != "" {
+				t.Fatalf("x-api-key leaked upstream: %q", seenAPIKey)
+			}
+			if seenAuth != "" {
+				t.Fatalf("Authorization leaked upstream: %q", seenAuth)
+			}
+			if seenGoogKey != "" {
+				t.Fatalf("X-Goog-Api-Key leaked upstream: %q", seenGoogKey)
+			}
 		})
-	})
-
-	srv := newTestServer(t, upstream)
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
-	req.Header.Set("X-Api-Key", "sk-ant-secret")
-	req.Header.Set("Authorization", "Bearer secret")
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	if seenAPIKey != "" {
-		t.Fatalf("x-api-key leaked upstream: %q", seenAPIKey)
-	}
-	if seenAuth != "" {
-		t.Fatalf("Authorization leaked upstream: %q", seenAuth)
 	}
 }
 

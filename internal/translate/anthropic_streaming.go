@@ -3,6 +3,7 @@ package translate
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,6 +66,17 @@ func WriteAnthropicStreamFromOpenAISSE(w http.ResponseWriter, body io.Reader, mo
 		}
 	}
 
+	// A 200 with no SSE frames at all means upstream did not stream: an empty
+	// body, or a plain JSON reply to a streaming request. Closing out cleanly
+	// there would report an empty completion as a success, so it is reported as
+	// an error instead. A stream that sent frames but no finish_reason is a
+	// different case and still closes cleanly.
+	if !writer.sawFrame {
+		err := errors.New("upstream returned no stream data")
+		writer.writeErrorEvent(err)
+		return err
+	}
+
 	return writer.finish()
 }
 
@@ -88,10 +100,11 @@ type anthropicStreamWriter struct {
 
 	started      bool
 	finished     bool
+	sawFrame     bool
 	nextIndex    int
 	openBlocks   []int
 	textIndex    int
-	toolIndices  map[int]int
+	toolBlocks   map[int]toolBlockRef
 	messageID    string
 	stopReason   string
 	inputTokens  int
@@ -99,14 +112,25 @@ type anthropicStreamWriter struct {
 	writeErr     error
 }
 
+// toolBlockRef remembers which Anthropic block an upstream tool-call index maps
+// to, along with the identity of the call occupying it. The identity matters
+// because OpenAI's tool-call index is `omitempty`: an upstream that never sends
+// it is indistinguishable from one that always sends 0, so index alone would
+// merge separate calls into one block and concatenate their JSON.
+type toolBlockRef struct {
+	index int
+	id    string
+	name  string
+}
+
 func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStreamWriter {
 	flusher, _ := w.(http.Flusher)
 	return &anthropicStreamWriter{
-		w:           w,
-		flusher:     flusher,
-		model:       model,
-		textIndex:   -1,
-		toolIndices: make(map[int]int),
+		w:          w,
+		flusher:    flusher,
+		model:      model,
+		textIndex:  -1,
+		toolBlocks: make(map[int]toolBlockRef),
 	}
 }
 
@@ -122,6 +146,7 @@ func (a *anthropicStreamWriter) consume(dataLines []string) error {
 	if len(dataLines) == 0 {
 		return nil
 	}
+	a.sawFrame = true
 
 	payload := strings.Join(dataLines, "\n")
 	if payload == "[DONE]" {
@@ -221,17 +246,32 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 		return
 	}
 
-	index, known := a.toolIndices[call.Index]
+	name := ""
+	if call.Function != nil {
+		name = call.Function.Name
+	}
+
+	ref, known := a.toolBlocks[call.Index]
+	// A delta that names a different call than the one holding this index means
+	// upstream started a new tool call rather than continuing the old one. Later
+	// fragments of a call carry no id or name, so only a differing non-empty
+	// value counts as a new call.
+	if known && startsNewToolCall(ref, call.ID, name) {
+		known = false
+	}
+
 	if !known {
-		name := ""
-		if call.Function != nil {
-			name = call.Function.Name
-		}
 		// Any text so far is complete once a tool call begins.
 		a.closeTextBlock()
-		index = a.startBlock(anthropic.ToolUseStreamBlock(anthropicToolUseID(call.ID, name), name))
-		a.toolIndices[call.Index] = index
+		id := anthropicToolUseID(call.ID, name)
+		ref = toolBlockRef{
+			index: a.startBlock(anthropic.ToolUseStreamBlock(id, name)),
+			id:    id,
+			name:  name,
+		}
+		a.toolBlocks[call.Index] = ref
 	}
+	index := ref.index
 
 	if call.Function == nil || call.Function.Arguments == "" {
 		return
@@ -245,6 +285,17 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 			PartialJSON: call.Function.Arguments,
 		},
 	})
+}
+
+// startsNewToolCall reports whether a tool-call delta identifies a different
+// call than the one already occupying its index. An id or name is only sent on
+// a call's first delta, so an empty value means "continuation" rather than
+// "different call".
+func startsNewToolCall(ref toolBlockRef, id, name string) bool {
+	if id != "" && id != ref.id {
+		return true
+	}
+	return name != "" && name != ref.name
 }
 
 // startBlock emits content_block_start for a new block and returns its index.

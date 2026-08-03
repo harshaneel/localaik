@@ -2,11 +2,14 @@ package translate
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/harshaneel/localaik/internal/protocol/anthropic"
+	openaip "github.com/harshaneel/localaik/internal/protocol/openai"
 )
 
 type sseEvent struct {
@@ -378,6 +381,145 @@ func TestWriteAnthropicStreamInterleavedToolCallsKeepBlocksOpen(t *testing.T) {
 	}
 }
 
+// OpenAI's tool_calls[].index is omitempty, so a runtime that never sends it is
+// indistinguishable from one that always sends 0. Separate calls must still get
+// separate blocks, or their JSON fragments concatenate into one invalid input.
+func TestWriteAnthropicStreamSeparatesToolCallsWithoutIndex(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"t0","type":"function","function":{"name":"first","arguments":"{\"x\":1}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"t1","type":"function","function":{"name":"second","arguments":"{\"y\":2}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	events, _ := writeAnthropicStream(t, upstream, "")
+
+	var starts []anthropic.StreamEvent
+	fragments := map[int]string{}
+	for _, event := range events {
+		decoded := decodeEvent(t, event)
+		switch event.name {
+		case anthropic.EventContentBlockStart:
+			starts = append(starts, decoded)
+		case anthropic.EventContentBlockDelta:
+			if decoded.Delta != nil && decoded.Delta.Type == anthropic.DeltaTypeInputJSON {
+				fragments[*decoded.Index] += decoded.Delta.PartialJSON
+			}
+		}
+	}
+
+	if len(starts) != 2 {
+		t.Fatalf("content_block_start count = %d, want 2 separate tool blocks; sequence = %v", len(starts), eventNames(events))
+	}
+	for i, want := range []struct{ id, name string }{{"t0", "first"}, {"t1", "second"}} {
+		block := starts[i].ContentBlock
+		if block == nil || block.ID != want.id || block.Name != want.name {
+			t.Fatalf("block %d = %#v, want id %q name %q", i, block, want.id, want.name)
+		}
+		if *starts[i].Index != i {
+			t.Fatalf("block %d index = %d, want %d", i, *starts[i].Index, i)
+		}
+	}
+
+	for index, want := range map[int]string{0: `{"x":1}`, 1: `{"y":2}`} {
+		if fragments[index] != want {
+			t.Fatalf("block %d reassembled to %q, want %q", index, fragments[index], want)
+		}
+	}
+}
+
+// Continuation fragments carry neither id nor name, so they must keep appending to
+// the block already open for their index.
+func TestWriteAnthropicStreamContinuesToolCallWithoutIDOrName(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t0","type":"function","function":{"name":"only","arguments":"{\"x\":"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	events, _ := writeAnthropicStream(t, upstream, "")
+
+	var starts, fragments int
+	reassembled := ""
+	for _, event := range events {
+		switch event.name {
+		case anthropic.EventContentBlockStart:
+			starts++
+		case anthropic.EventContentBlockDelta:
+			decoded := decodeEvent(t, event)
+			if decoded.Delta != nil && decoded.Delta.Type == anthropic.DeltaTypeInputJSON {
+				fragments++
+				reassembled += decoded.Delta.PartialJSON
+			}
+		}
+	}
+
+	if starts != 1 {
+		t.Fatalf("content_block_start count = %d, want 1; sequence = %v", starts, eventNames(events))
+	}
+	if fragments != 2 || reassembled != `{"x":1}` {
+		t.Fatalf("reassembled %d fragments to %q, want 2 fragments making {\"x\":1}", fragments, reassembled)
+	}
+}
+
+// A repeated name on every fragment must not be mistaken for a new call.
+func TestWriteAnthropicStreamToolCallRepeatingNameStaysOneBlock(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t0","type":"function","function":{"name":"only","arguments":"{\"x\":"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t0","type":"function","function":{"name":"only","arguments":"1}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	events, _ := writeAnthropicStream(t, upstream, "")
+
+	starts := 0
+	for _, event := range events {
+		if event.name == anthropic.EventContentBlockStart {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("content_block_start count = %d, want 1; sequence = %v", starts, eventNames(events))
+	}
+}
+
+// A 200 with no SSE frames means upstream did not stream. Reporting a clean empty
+// message there would present a broken upstream as a successful completion.
+func TestWriteAnthropicStreamNoFramesIsAnError(t *testing.T) {
+	cases := map[string]string{
+		"empty_body":       "",
+		"plain_json_reply": `{"choices":[{"message":{"content":"not a stream"}}]}`,
+	}
+
+	for name, upstream := range cases {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			err := WriteAnthropicStreamFromOpenAISSE(recorder, strings.NewReader(upstream), "")
+			if err == nil {
+				t.Fatal("expected an error when upstream sent no SSE frames")
+			}
+
+			events := parseAnthropicSSE(t, recorder.Body.String())
+			if len(events) != 1 || events[0].name != anthropic.EventError {
+				t.Fatalf("events = %v, want a single error event", eventNames(events))
+			}
+			if !strings.Contains(events[0].data, "no stream data") {
+				t.Fatalf("error event = %s, want it to name the cause", events[0].data)
+			}
+		})
+	}
+}
+
 func TestWriteAnthropicStreamTextAfterToolOpensNewBlock(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"choices":[{"index":0,"delta":{"content":"before"}}]}`,
@@ -562,6 +704,66 @@ func TestWriteAnthropicStreamMalformedPayloadEmitsErrorEvent(t *testing.T) {
 	}
 	if errorEvent.Error.Type != anthropic.ErrorTypeAPI {
 		t.Fatalf("error type = %q, want %q", errorEvent.Error.Type, anthropic.ErrorTypeAPI)
+	}
+}
+
+// failingWriter fails every write, standing in for a client that disconnected
+// partway through a stream.
+type failingWriter struct {
+	header http.Header
+	writes int
+}
+
+func (f *failingWriter) Header() http.Header {
+	if f.header == nil {
+		f.header = make(http.Header)
+	}
+	return f.header
+}
+
+func (f *failingWriter) Write([]byte) (int, error) {
+	f.writes++
+	return 0, errors.New("client gone")
+}
+
+func (f *failingWriter) WriteHeader(int) {}
+
+// Once a write fails there is nowhere to report anything, so the translator must
+// give up rather than keep formatting events for a dead connection.
+func TestWriteAnthropicStreamStopsWritingAfterWriteFailure(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"content":"one"}}]}`,
+		``,
+		`data: {"choices":[{"index":0,"delta":{"content":"two"}}]}`,
+		``,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	writer := &failingWriter{}
+	err := WriteAnthropicStreamFromOpenAISSE(writer, strings.NewReader(upstream), "")
+	if err == nil {
+		t.Fatal("expected the write failure to surface as an error")
+	}
+	if writer.writes != 1 {
+		t.Fatalf("attempted %d writes, want 1: the first failure should stop the stream", writer.writes)
+	}
+}
+
+func TestOpenAIToolCallsToAnthropicBlocksSkipsUnusableCalls(t *testing.T) {
+	blocks := openAIToolCallsToAnthropicBlocks([]openaip.ToolCall{
+		{ID: "keep", Type: "function", Function: &openaip.ToolCallFunction{Name: "ok", Arguments: `{}`}},
+		{ID: "no_function", Type: "function"},
+		{ID: "not_a_function", Type: "retrieval", Function: &openaip.ToolCallFunction{Name: "nope"}},
+	})
+
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %#v, want only the usable function call", blocks)
+	}
+	if blocks[0].ID != "keep" || blocks[0].Name != "ok" {
+		t.Fatalf("block = %#v", blocks[0])
 	}
 }
 

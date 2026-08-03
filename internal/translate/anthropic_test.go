@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/harshaneel/localaik/internal/pdf"
@@ -317,6 +319,143 @@ func TestAnthropicRequestToOpenAIToolResultErrorFlag(t *testing.T) {
 	}
 }
 
+// A tool_use block in a user-role message cannot become an OpenAI tool call, so
+// it is preserved as text context instead of being dropped.
+func TestAnthropicRequestToOpenAIUserRoleToolUseBecomesText(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 32,
+		"messages": [{"role": "user", "content": [
+			{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+		]}]
+	}`)
+
+	got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+	if len(got.Messages) != 1 {
+		t.Fatalf("messages = %#v, want one user message", got.Messages)
+	}
+	if len(got.Messages[0].ToolCalls) != 0 {
+		t.Fatalf("user message has tool calls %#v, want none", got.Messages[0].ToolCalls)
+	}
+	want := `Tool use get_weather: {"city": "Paris"}`
+	if got.Messages[0].Content != want {
+		t.Fatalf("content = %#v, want %q", got.Messages[0].Content, want)
+	}
+}
+
+// An OpenAI tool message carries a plain string, so non-text tool_result blocks
+// are summarised rather than silently dropped.
+func TestAnthropicRequestToOpenAIToolResultNonTextBlocks(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 32,
+		"messages": [{"role": "user", "content": [{
+			"type": "tool_result",
+			"tool_use_id": "toolu_1",
+			"content": [
+				{"type": "text", "text": "here is the chart"},
+				{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+				{"type": "document", "source": {"type": "base64"}}
+			]
+		}]}]
+	}`)
+
+	got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+
+	want := "here is the chart\n[image image/png]\n[document]"
+	if got.Messages[0].Content != want {
+		t.Fatalf("tool content = %#v, want %q", got.Messages[0].Content, want)
+	}
+}
+
+func TestAnthropicRequestToOpenAISourceErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "undecodable_base64",
+			body: `{"max_tokens":16,"messages":[{"role":"user","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"!!!not base64!!!"}}
+			]}]}`,
+		},
+		{
+			name: "unsupported_source_type",
+			body: `{"max_tokens":16,"messages":[{"role":"user","content":[
+				{"type":"image","source":{"type":"file_id","media_type":"image/png"}}
+			]}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := decodeAnthropicRequest(t, tc.body)
+
+			_, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+			if err == nil {
+				t.Fatal("expected an error for an unusable source")
+			}
+		})
+	}
+}
+
+// A source-less image or document block carries nothing translatable, so it is
+// skipped rather than erroring.
+func TestAnthropicRequestToOpenAISourcelessBlockIsSkipped(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 16,
+		"messages": [{"role": "user", "content": [
+			{"type": "image"},
+			{"type": "text", "text": "still here"}
+		]}]
+	}`)
+
+	got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+	if got.Messages[0].Content != "still here" {
+		t.Fatalf("content = %#v, want only the text", got.Messages[0].Content)
+	}
+}
+
+// Anthropic server tools carry a versioned type and no input_schema. localaik
+// cannot run them, so forwarding them as callable functions would invite the
+// model to call something that does not exist.
+func TestAnthropicRequestToOpenAISkipsServerTools(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 32,
+		"tools": [
+			{"type": "web_search_20250305", "name": "web_search"},
+			{"type": "computer_20241022", "name": "computer"},
+			{"name": "get_weather", "input_schema": {"type": "object"}},
+			{"type": "custom", "name": "explicitly_custom", "input_schema": {"type": "object"}}
+		],
+		"messages": [{"role": "user", "content": "hi"}]
+	}`)
+
+	got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+
+	var names []string
+	for _, tool := range got.Tools {
+		if tool.Function == nil {
+			t.Fatalf("tool without a function: %#v", tool)
+		}
+		names = append(names, tool.Function.Name)
+	}
+	want := []string{"get_weather", "explicitly_custom"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("forwarded tools = %v, want %v", names, want)
+	}
+}
+
 func TestAnthropicToolChoiceMapping(t *testing.T) {
 	cases := []struct {
 		name string
@@ -580,6 +719,58 @@ func TestOpenAIFinishReasonToAnthropic(t *testing.T) {
 	}
 }
 
+// Clients that omit ids must still produce a matching tool_call_id / tool call
+// pair, since an empty tool_call_id is not a usable OpenAI value.
+func TestAnthropicToolIDFallbacksAgreeAcrossSides(t *testing.T) {
+	req := decodeAnthropicRequest(t, `{
+		"max_tokens": 32,
+		"messages": [
+			{"role": "assistant", "content": [{"type": "tool_use", "name": "", "input": {}}]},
+			{"role": "user", "content": [{"type": "tool_result", "content": "done"}]}
+		]
+	}`)
+
+	got, err := AnthropicRequestToOpenAI(context.Background(), req, nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages = %#v, want assistant + tool", got.Messages)
+	}
+
+	if len(got.Messages[0].ToolCalls) != 1 {
+		t.Fatalf("assistant tool calls = %#v, want one", got.Messages[0].ToolCalls)
+	}
+	callID := got.Messages[0].ToolCalls[0].ID
+	if callID == "" {
+		t.Fatal("tool call id is empty")
+	}
+	if got.Messages[1].ToolCallID != callID {
+		t.Fatalf("tool_call_id = %q, want it to match the tool call id %q", got.Messages[1].ToolCallID, callID)
+	}
+}
+
+func TestAnthropicToolUseIDFallbacks(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+		tool string
+		want string
+	}{
+		{"uses_given_id", "toolu_abc", "get_weather", "toolu_abc"},
+		{"derives_from_name", "", "Get Weather", "toolu_get_weather"},
+		{"falls_back_when_bare", "", "", "toolu_localaik"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := anthropicToolUseID(tc.id, tc.tool); got != tc.want {
+				t.Fatalf("anthropicToolUseID(%q, %q) = %q, want %q", tc.id, tc.tool, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCountTokensTextFromAnthropic(t *testing.T) {
 	imageData := base64.StdEncoding.EncodeToString([]byte("png"))
 
@@ -600,6 +791,36 @@ func TestCountTokensTextFromAnthropic(t *testing.T) {
 	want := "system prompt\nfirst\nsecond\nthird"
 	if got != want {
 		t.Fatalf("CountTokensTextFromAnthropic = %q, want %q", got, want)
+	}
+}
+
+// A text-source document block is inlined into the prompt by /v1/messages, so it
+// has to be counted too, or count_tokens disagrees with what actually gets sent.
+func TestCountTokensTextFromAnthropicIncludesTextDocuments(t *testing.T) {
+	body := `{
+		"max_tokens": 16,
+		"messages": [{"role": "user", "content": [
+			{"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "contract body"}},
+			{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+			{"type": "text", "text": "summarise"}
+		]}]
+	}`
+
+	req := decodeAnthropicRequest(t, body)
+
+	got := CountTokensTextFromAnthropic(req)
+	want := "contract body\nsummarise"
+	if got != want {
+		t.Fatalf("CountTokensTextFromAnthropic = %q, want %q (base64 PDFs stay uncounted)", got, want)
+	}
+
+	// The same document must reach the model, so the two paths agree on it.
+	translated, err := AnthropicRequestToOpenAI(context.Background(), decodeAnthropicRequest(t, body), nopRenderer())
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI returned error: %v", err)
+	}
+	if !strings.Contains(fmt.Sprint(translated.Messages[0].Content), "contract body") {
+		t.Fatalf("translated content = %#v, want the document text inlined", translated.Messages[0].Content)
 	}
 }
 

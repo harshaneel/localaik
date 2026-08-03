@@ -297,9 +297,10 @@ jobs:
 | Behavior | localaik |
 | --- | --- |
 | `stop_reason: "stop_sequence"` | Never emitted. The upstream runtime reports plain `stop` for both a natural end of turn and a stop-sequence hit, so those come back as `end_turn`. |
-| `count_tokens` on multimodal input | Counts text only. Images, documents, and tool blocks are skipped, so counts run lower than the real API. |
+| `count_tokens` on multimodal input | Counts text only, including text-source `document` blocks. Images, base64 documents, and tool blocks are skipped, so counts run lower than the real API. |
 | Streamed `usage` | Only as good as what upstream reports; the counts are zero when the runtime omits usage from streamed responses. |
-| A stream that ends without a `finish_reason` | Closed out as `end_turn` rather than reported as an error, so a runtime that omits the field still produces a usable response. A truncated upstream stream therefore looks complete. |
+| A stream that ends without a `finish_reason` | Closed out as `end_turn` rather than reported as an error, so a runtime that omits the field still produces a usable response. A truncated upstream stream therefore looks complete. A `200` carrying no stream frames at all is reported as an error rather than an empty message. |
+| Anthropic server tools in `tools` | Skipped rather than forwarded. localaik cannot run web search, code execution, or computer use, so offering them to the model would invite calls that go nowhere. |
 | Multiple upstream choices while streaming | The stream follows the lowest choice index; the rest are dropped. |
 | `thinking` / `redacted_thinking` blocks in request history | Accepted and dropped rather than replayed into the prompt. |
 | Multiple candidates | Only the first upstream choice becomes the message; the Messages API returns one message. |

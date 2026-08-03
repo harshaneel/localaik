@@ -134,9 +134,10 @@ func OpenAIErrorToAnthropic(statusCode int, body []byte) anthropic.ErrorResponse
 }
 
 // CountTokensTextFromAnthropic flattens a Messages request into a single text
-// payload for llama.cpp's /tokenize endpoint. Non-text blocks (images,
-// documents, tool calls) are skipped — the text tokenizer cannot measure them,
-// so counts for multimodal requests are lower than the real API reports.
+// payload for llama.cpp's /tokenize endpoint. Blocks the text tokenizer cannot
+// measure (images, base64 documents, tool call inputs) are skipped, so counts
+// for those requests come out lower than the real API reports. Text-source
+// document blocks are included, since /v1/messages inlines them into the prompt.
 func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 	var b strings.Builder
 
@@ -162,6 +163,10 @@ func CountTokensTextFromAnthropic(req anthropic.MessagesRequest) string {
 			case anthropic.BlockTypeToolResult:
 				if block.Content != nil {
 					appendText(block.Content.Text())
+				}
+			case anthropic.BlockTypeDocument:
+				if block.Source != nil && block.Source.Type == anthropic.SourceTypeText {
+					appendText(block.Source.Data)
 				}
 			}
 		}
@@ -303,8 +308,10 @@ func anthropicToolResultToOpenAIMessage(block anthropic.ContentBlock) openaip.Me
 	}
 
 	return openaip.Message{
-		Role:       "tool",
-		ToolCallID: block.ToolUseID,
+		Role: "tool",
+		// Same fallback as the tool_use side, so a client that omits ids still
+		// produces a matching pair rather than an empty tool_call_id.
+		ToolCallID: toolCallID(block.ToolUseID, ""),
 		Content:    text,
 	}
 }
@@ -350,6 +357,13 @@ func anthropicToolsToOpenAITools(tools []anthropic.Tool) []openaip.Tool {
 	var out []openaip.Tool
 	for _, tool := range tools {
 		if tool.Name == "" {
+			continue
+		}
+		// Server tools (computer use, web search, code execution) are identified by
+		// a versioned `type` and carry no input_schema. localaik cannot run them, so
+		// they are skipped rather than forwarded as a parameterless function that
+		// the model might try to call.
+		if tool.Type != "" && tool.Type != "custom" {
 			continue
 		}
 		out = append(out, openaip.Tool{

@@ -50,11 +50,6 @@ func StringContent(text string) Content {
 	return c
 }
 
-// BlockContent builds a Content that marshals back as a JSON array of blocks.
-func BlockContent(blocks ...ContentBlock) Content {
-	return Content{Blocks: blocks}
-}
-
 func (c *Content) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -219,7 +214,6 @@ const (
 	EventContentBlockStart = "content_block_start"
 	EventContentBlockDelta = "content_block_delta"
 	EventContentBlockStop  = "content_block_stop"
-	EventPing              = "ping"
 	EventError             = "error"
 )
 
