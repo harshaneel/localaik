@@ -81,18 +81,27 @@ func WriteAnthropicStreamFromOpenAISSE(w http.ResponseWriter, body io.Reader, mo
 }
 
 // anthropicStreamWriter tracks the block bookkeeping the Anthropic event
-// sequence requires.
+// sequence requires. Block indices start at 0 and increase by exactly one per
+// block, which the SDK accumulators enforce on content_block_start.
 //
-// Block indices start at 0 and increase by exactly one per block, which the
-// Anthropic SDK accumulators enforce on content_block_start. Delta and stop
-// events address a block by index and may interleave across blocks that are
-// still open, which is what makes the lifetime rules below safe:
+// Text streams through as it arrives. Tool calls do not: a content_block_start
+// has to commit to the call's id and name, and upstream may still be revealing
+// them — OpenAI sends a tool call's identity and arguments across an unspecified
+// number of deltas, and its `index` is `omitempty`, so an upstream that never
+// sends one is indistinguishable from one that always sends 0. Committing early
+// and then trying to tell a continuation from a new call by comparing identity
+// cannot be made correct: whichever way the comparison is tuned, some upstream
+// either merges two calls into one block or splits one call across two.
 //
-//   - A text block is closed as soon as a tool block starts. Text arriving later
-//     opens a fresh text block, exactly as the Messages API does.
-//   - A tool block stays open until the stream ends. Upstream can resume an
-//     earlier tool-call index after starting a later one, and closing a tool
-//     block early would stop it holding a half-written JSON fragment.
+// So each tool call is buffered and emitted as a complete unit
+// (content_block_start / one input_json_delta / content_block_stop) once its
+// arguments parse as JSON, by which point its identity has settled. Buffering
+// also means a block is never left holding a half-written fragment, and the
+// pending slot is empty afterwards, so a later delta at the same index is
+// unambiguously a new call and needs no comparison at all.
+//
+// The cost is that tool arguments reach the client in one input_json_delta
+// rather than several. The SDK accumulators build the same result either way.
 type anthropicStreamWriter struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
@@ -102,9 +111,8 @@ type anthropicStreamWriter struct {
 	finished     bool
 	sawFrame     bool
 	nextIndex    int
-	openBlocks   []int
 	textIndex    int
-	toolBlocks   map[int]toolBlockRef
+	pendingTools map[int]*pendingToolCall
 	messageID    string
 	stopReason   string
 	inputTokens  int
@@ -112,58 +120,47 @@ type anthropicStreamWriter struct {
 	writeErr     error
 }
 
-// toolBlockRef remembers which Anthropic block an upstream tool-call index maps
-// to, along with enough about the call occupying it to tell a continuation from
-// a different call. Identity matters because OpenAI's tool-call index is
-// `omitempty`: an upstream that never sends it is indistinguishable from one
-// that always sends 0, so index alone would merge separate calls into one block
-// and concatenate their JSON.
-//
-// upstreamID is the id exactly as upstream sent it, kept apart from the id
-// emitted downstream, which may have been synthesized from the name.
-type toolBlockRef struct {
-	index      int
+// pendingToolCall accumulates one upstream tool call until it can be emitted.
+// upstreamID is the id as upstream sent it; the id emitted downstream may be
+// synthesized from the name when upstream sends none.
+type pendingToolCall struct {
 	upstreamID string
 	name       string
 	arguments  string
 }
 
-// argumentsComplete reports whether the fragments seen so far form a whole JSON
-// value. A call still mid-object cannot have ended, whatever its next delta says.
-func (r toolBlockRef) argumentsComplete() bool {
-	return r.arguments == "" || json.Valid([]byte(r.arguments))
+// complete reports whether the arguments seen so far form a whole JSON object,
+// which is the signal that no further delta will refine this call.
+//
+// The object requirement is not incidental: json.Valid alone accepts bare scalars,
+// so a malformed `arguments` of "1" would look finished and be forwarded as a
+// tool input that is not an object.
+func (p *pendingToolCall) complete() bool {
+	return isJSONObject(p.arguments)
 }
 
-// startsNewToolCall reports whether a tool-call delta belongs to a different call
-// than the one already occupying its index.
-//
-// Arguments completeness gates the decision: a block holding a half-written JSON
-// object is always treated as a continuation, because splitting there would leave
-// two blocks each holding an unparseable fragment, and the SDK accumulators
-// marshal a block when it stops. Only once the current call's arguments parse can
-// a differing identity mean a genuinely new call.
-//
-// Ids win when either side has one. Names are only compared when neither does,
-// and only when both are non-empty, so a name that arrives a delta later than the
-// id does not look like a new call.
-func startsNewToolCall(ref toolBlockRef, id, name string) bool {
-	if !ref.argumentsComplete() {
-		return false
+// observeName folds a name fragment into the call. Upstreams variously send the
+// name once, repeat it in full on every delta, or (in principle) split it, so a
+// repeat is ignored and anything else is appended.
+func (p *pendingToolCall) observeName(name string) {
+	switch {
+	case name == "" || name == p.name:
+		return
+	case p.name == "":
+		p.name = name
+	default:
+		p.name += name
 	}
-	if ref.upstreamID != "" || id != "" {
-		return id != "" && ref.upstreamID != "" && id != ref.upstreamID
-	}
-	return name != "" && ref.name != "" && name != ref.name
 }
 
 func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStreamWriter {
 	flusher, _ := w.(http.Flusher)
 	return &anthropicStreamWriter{
-		w:          w,
-		flusher:    flusher,
-		model:      model,
-		textIndex:  -1,
-		toolBlocks: make(map[int]toolBlockRef),
+		w:            w,
+		flusher:      flusher,
+		model:        model,
+		textIndex:    -1,
+		pendingTools: make(map[int]*pendingToolCall),
 	}
 }
 
@@ -279,58 +276,91 @@ func (a *anthropicStreamWriter) writeToolCallDelta(call openaip.ToolCallDelta) {
 		return
 	}
 
-	name := ""
+	pending, ok := a.pendingTools[call.Index]
+	if !ok {
+		pending = &pendingToolCall{}
+		a.pendingTools[call.Index] = pending
+	}
+
+	if call.ID != "" {
+		pending.upstreamID = call.ID
+	}
 	if call.Function != nil {
-		name = call.Function.Name
+		pending.observeName(call.Function.Name)
+		pending.arguments += call.Function.Arguments
 	}
 
-	ref, known := a.toolBlocks[call.Index]
-	if known && startsNewToolCall(ref, call.ID, name) {
-		known = false
-	}
+	a.flushCompletedToolCalls()
+}
 
-	if !known {
-		// Any text so far is complete once a tool call begins.
-		a.closeTextBlock()
-		ref = toolBlockRef{
-			index:      a.startBlock(anthropic.ToolUseStreamBlock(anthropicToolUseID(call.ID, name), name)),
-			upstreamID: call.ID,
-			name:       name,
+// flushCompletedToolCalls emits every pending call whose arguments have parsed,
+// lowest upstream index first, stopping at the first index that is still
+// incomplete. Holding later calls back keeps the emitted blocks in upstream's
+// order even when a higher index finishes first.
+func (a *anthropicStreamWriter) flushCompletedToolCalls() {
+	for {
+		index, ok := a.lowestPendingToolIndex()
+		if !ok || !a.pendingTools[index].complete() {
+			return
 		}
-	} else {
-		// Fill in identity that arrived a delta later than the block was opened.
-		if ref.upstreamID == "" {
-			ref.upstreamID = call.ID
-		}
-		if ref.name == "" {
-			ref.name = name
+		a.flushToolCall(index)
+	}
+}
+
+func (a *anthropicStreamWriter) lowestPendingToolIndex() (int, bool) {
+	lowest := 0
+	found := false
+	for index := range a.pendingTools {
+		if !found || index < lowest {
+			lowest = index
+			found = true
 		}
 	}
+	return lowest, found
+}
 
-	if call.Function != nil && call.Function.Arguments != "" {
-		ref.arguments += call.Function.Arguments
-	}
-	a.toolBlocks[call.Index] = ref
-
-	if call.Function == nil || call.Function.Arguments == "" {
+// flushToolCall emits one buffered call as a complete content block. Arguments
+// that never became parseable are replaced with an empty object, so a block is
+// never handed to the client holding JSON it cannot decode.
+func (a *anthropicStreamWriter) flushToolCall(upstreamIndex int) {
+	pending, ok := a.pendingTools[upstreamIndex]
+	if !ok {
 		return
 	}
+	delete(a.pendingTools, upstreamIndex)
 
-	a.writeEvent(anthropic.EventContentBlockDelta, anthropic.ContentBlockDeltaEvent{
-		Type:  anthropic.EventContentBlockDelta,
-		Index: ref.index,
-		Delta: anthropic.BlockDelta{
-			Type:        anthropic.DeltaTypeInputJSON,
-			PartialJSON: call.Function.Arguments,
-		},
-	})
+	// Whatever text came before is complete once a tool call is emitted.
+	a.closeTextBlock()
+
+	// Arguments that never became a whole object are replaced, so a block is never
+	// handed to the client holding input it cannot decode.
+	input := string(anthropicToolInput(pending.arguments))
+
+	index := a.startBlock(anthropic.ToolUseStreamBlock(
+		anthropicToolUseID(pending.upstreamID, pending.name),
+		pending.name,
+	))
+
+	// content_block_start already carries an empty object, so only a real
+	// argument payload needs a delta.
+	if input != "{}" {
+		a.writeEvent(anthropic.EventContentBlockDelta, anthropic.ContentBlockDeltaEvent{
+			Type:  anthropic.EventContentBlockDelta,
+			Index: index,
+			Delta: anthropic.BlockDelta{
+				Type:        anthropic.DeltaTypeInputJSON,
+				PartialJSON: input,
+			},
+		})
+	}
+
+	a.closeBlock(index)
 }
 
 // startBlock emits content_block_start for a new block and returns its index.
 func (a *anthropicStreamWriter) startBlock(block anthropic.StreamContentBlock) int {
 	index := a.nextIndex
 	a.nextIndex++
-	a.openBlocks = append(a.openBlocks, index)
 
 	a.writeEvent(anthropic.EventContentBlockStart, anthropic.ContentBlockStartEvent{
 		Type:         anthropic.EventContentBlockStart,
@@ -350,13 +380,6 @@ func (a *anthropicStreamWriter) closeTextBlock() {
 }
 
 func (a *anthropicStreamWriter) closeBlock(index int) {
-	for i, open := range a.openBlocks {
-		if open == index {
-			a.openBlocks = append(a.openBlocks[:i], a.openBlocks[i+1:]...)
-			break
-		}
-	}
-
 	a.writeEvent(anthropic.EventContentBlockStop, anthropic.ContentBlockStopEvent{
 		Type:  anthropic.EventContentBlockStop,
 		Index: index,
@@ -375,12 +398,16 @@ func (a *anthropicStreamWriter) finish() error {
 
 	a.ensureStarted()
 
-	// openBlocks is append-only against a monotonic counter, so it is already in
-	// ascending index order.
-	for len(a.openBlocks) > 0 {
-		a.closeBlock(a.openBlocks[0])
+	// Any call whose arguments never parsed still becomes a block, so a tool call
+	// upstream cut short is visible to the client rather than dropped.
+	for {
+		index, ok := a.lowestPendingToolIndex()
+		if !ok {
+			break
+		}
+		a.flushToolCall(index)
 	}
-	a.textIndex = -1
+	a.closeTextBlock()
 
 	stopReason := a.stopReason
 	if stopReason == "" {

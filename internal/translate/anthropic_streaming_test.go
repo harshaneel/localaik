@@ -66,6 +66,14 @@ func decodeEvent(t *testing.T, event sseEvent) anthropic.StreamEvent {
 	return decoded
 }
 
+// mustWriteStream translates upstream and returns the parsed events, failing on
+// any translation error.
+func mustWriteStream(t *testing.T, upstream string) []sseEvent {
+	t.Helper()
+	events, _ := writeAnthropicStream(t, upstream, "")
+	return events
+}
+
 func writeAnthropicStream(t *testing.T, upstream, model string) ([]sseEvent, *httptest.ResponseRecorder) {
 	t.Helper()
 
@@ -175,10 +183,11 @@ func TestWriteAnthropicStreamToolCall(t *testing.T) {
 
 	events, _ := writeAnthropicStream(t, upstream, "")
 
+	// A tool call is buffered until its arguments parse, then emitted as one
+	// complete block, so upstream's two argument fragments become a single delta.
 	want := []string{
 		anthropic.EventMessageStart,
 		anthropic.EventContentBlockStart,
-		anthropic.EventContentBlockDelta,
 		anthropic.EventContentBlockDelta,
 		anthropic.EventContentBlockStop,
 		anthropic.EventMessageDelta,
@@ -200,21 +209,17 @@ func TestWriteAnthropicStreamToolCall(t *testing.T) {
 		t.Fatalf("tool_use input = %s, want an empty object at block start", block.Input)
 	}
 
-	// The first upstream delta carries empty arguments and must not produce a
-	// partial_json event; only the two fragments below do.
-	for i, wantFragment := range []string{`{"city":`, `"Paris"}`} {
-		delta := decodeEvent(t, events[2+i])
-		if delta.Delta == nil || delta.Delta.Type != anthropic.DeltaTypeInputJSON {
-			t.Fatalf("delta %d = %s, want input_json_delta", i, events[2+i].data)
-		}
-		if delta.Delta.PartialJSON != wantFragment {
-			t.Fatalf("delta %d partial_json = %q, want %q", i, delta.Delta.PartialJSON, wantFragment)
-		}
+	delta := decodeEvent(t, events[2])
+	if delta.Delta == nil || delta.Delta.Type != anthropic.DeltaTypeInputJSON {
+		t.Fatalf("delta = %s, want input_json_delta", events[2].data)
+	}
+	if delta.Delta.PartialJSON != `{"city":"Paris"}` {
+		t.Fatalf("partial_json = %q, want the reassembled arguments", delta.Delta.PartialJSON)
 	}
 
-	messageDelta := decodeEvent(t, events[5])
+	messageDelta := decodeEvent(t, events[4])
 	if messageDelta.Delta == nil || messageDelta.Delta.StopReason == nil {
-		t.Fatalf("message_delta = %s, want a stop_reason", events[5].data)
+		t.Fatalf("message_delta = %s, want a stop_reason", events[4].data)
 	}
 	if *messageDelta.Delta.StopReason != anthropic.StopReasonToolUse {
 		t.Fatalf("stop_reason = %q, want tool_use", *messageDelta.Delta.StopReason)
@@ -235,13 +240,14 @@ func TestWriteAnthropicStreamTextThenToolCallUsesSequentialBlocks(t *testing.T) 
 
 	events, _ := writeAnthropicStream(t, upstream, "")
 
+	// The tool call's arguments are already an empty object, which
+	// content_block_start carries, so no input_json_delta is needed.
 	want := []string{
 		anthropic.EventMessageStart,
 		anthropic.EventContentBlockStart, // text, index 0
 		anthropic.EventContentBlockDelta,
 		anthropic.EventContentBlockStop,  // index 0 closes before the tool block opens
 		anthropic.EventContentBlockStart, // tool_use, index 1
-		anthropic.EventContentBlockDelta,
 		anthropic.EventContentBlockStop,
 		anthropic.EventMessageDelta,
 		anthropic.EventMessageStop,
@@ -262,8 +268,11 @@ func TestWriteAnthropicStreamTextThenToolCallUsesSequentialBlocks(t *testing.T) 
 	if toolStart.ContentBlock == nil || toolStart.ContentBlock.Type != anthropic.BlockTypeToolUse {
 		t.Fatalf("tool content_block_start = %s", events[4].data)
 	}
+	if string(toolStart.ContentBlock.Input) != `{}` {
+		t.Fatalf("tool input = %s, want an empty object", toolStart.ContentBlock.Input)
+	}
 
-	toolStop := decodeEvent(t, events[6])
+	toolStop := decodeEvent(t, events[5])
 	if toolStop.Index == nil || *toolStop.Index != 1 {
 		t.Fatalf("tool content_block_stop index = %v, want 1", toolStop.Index)
 	}
@@ -314,9 +323,9 @@ func TestWriteAnthropicStreamHandlesMissingTrailingDone(t *testing.T) {
 }
 
 // Upstream may start a second tool call before the first one's arguments finish
-// streaming. Closing the first block at that point would stop it holding a
-// half-written JSON fragment, so tool blocks stay open until the stream ends.
-func TestWriteAnthropicStreamInterleavedToolCallsKeepBlocksOpen(t *testing.T) {
+// streaming, and may finish the second first. The emitted blocks must still
+// follow upstream's index order, and neither may carry a partial fragment.
+func TestWriteAnthropicStreamInterleavedToolCallsPreserveUpstreamOrder(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t0","type":"function","function":{"name":"a","arguments":"{\"x\":"}}]}}]}`,
 		``,
@@ -332,15 +341,16 @@ func TestWriteAnthropicStreamInterleavedToolCallsKeepBlocksOpen(t *testing.T) {
 
 	events, _ := writeAnthropicStream(t, upstream, "")
 
+	// Tool call b completes first, but it is held back so that a, at the lower
+	// upstream index, still becomes block 0.
 	want := []string{
 		anthropic.EventMessageStart,
 		anthropic.EventContentBlockStart, // tool a, index 0
-		anthropic.EventContentBlockDelta, // {"x":
+		anthropic.EventContentBlockDelta, // {"x":1}
+		anthropic.EventContentBlockStop,
 		anthropic.EventContentBlockStart, // tool b, index 1
 		anthropic.EventContentBlockDelta, // {"y":2}
-		anthropic.EventContentBlockDelta, // 1}  resumes index 0, still open
-		anthropic.EventContentBlockStop,  // index 0
-		anthropic.EventContentBlockStop,  // index 1
+		anthropic.EventContentBlockStop,
 		anthropic.EventMessageDelta,
 		anthropic.EventMessageStop,
 	}
@@ -348,38 +358,33 @@ func TestWriteAnthropicStreamInterleavedToolCallsKeepBlocksOpen(t *testing.T) {
 		t.Fatalf("event sequence = %v, want %v", got, want)
 	}
 
-	// No stop may precede the resumed delta for index 0.
-	resumed := decodeEvent(t, events[5])
-	if resumed.Index == nil || *resumed.Index != 0 {
-		t.Fatalf("resumed delta index = %v, want 0", resumed.Index)
-	}
-	if resumed.Delta == nil || resumed.Delta.PartialJSON != "1}" {
-		t.Fatalf("resumed delta = %s, want the trailing fragment", events[5].data)
-	}
+	for i, want := range []struct {
+		index int
+		name  string
+		input string
+	}{
+		{0, "a", `{"x":1}`},
+		{1, "b", `{"y":2}`},
+	} {
+		start := decodeEvent(t, events[1+i*3])
+		if start.Index == nil || *start.Index != want.index {
+			t.Fatalf("block %d start index = %v, want %d", i, start.Index, want.index)
+		}
+		if start.ContentBlock == nil || start.ContentBlock.Name != want.name {
+			t.Fatalf("block %d = %#v, want name %q", i, start.ContentBlock, want.name)
+		}
 
-	// Stops close in ascending index order, once each.
-	for i, wantIndex := range []int{0, 1} {
-		stop := decodeEvent(t, events[6+i])
-		if stop.Index == nil || *stop.Index != wantIndex {
-			t.Fatalf("stop %d index = %v, want %d", i, stop.Index, wantIndex)
+		delta := decodeEvent(t, events[2+i*3])
+		if delta.Delta == nil || delta.Delta.PartialJSON != want.input {
+			t.Fatalf("block %d input = %s, want %q", i, events[2+i*3].data, want.input)
 		}
-	}
+		if !json.Valid([]byte(delta.Delta.PartialJSON)) {
+			t.Fatalf("block %d input %q is not valid JSON", i, delta.Delta.PartialJSON)
+		}
 
-	// Reassembling the fragments per block must yield valid JSON objects.
-	fragments := map[int]string{}
-	for _, event := range events {
-		if event.name != anthropic.EventContentBlockDelta {
-			continue
-		}
-		decoded := decodeEvent(t, event)
-		if decoded.Delta == nil || decoded.Delta.Type != anthropic.DeltaTypeInputJSON {
-			continue
-		}
-		fragments[*decoded.Index] += decoded.Delta.PartialJSON
-	}
-	for index, want := range map[int]string{0: `{"x":1}`, 1: `{"y":2}`} {
-		if fragments[index] != want {
-			t.Fatalf("block %d reassembled to %q, want %q", index, fragments[index], want)
+		stop := decodeEvent(t, events[3+i*3])
+		if stop.Index == nil || *stop.Index != want.index {
+			t.Fatalf("block %d stop index = %v, want %d", i, stop.Index, want.index)
 		}
 	}
 }
@@ -449,114 +454,6 @@ func TestWriteAnthropicStreamContinuesToolCallWithoutIDOrName(t *testing.T) {
 
 	events, _ := writeAnthropicStream(t, upstream, "")
 
-	var starts, fragments int
-	reassembled := ""
-	for _, event := range events {
-		switch event.name {
-		case anthropic.EventContentBlockStart:
-			starts++
-		case anthropic.EventContentBlockDelta:
-			decoded := decodeEvent(t, event)
-			if decoded.Delta != nil && decoded.Delta.Type == anthropic.DeltaTypeInputJSON {
-				fragments++
-				reassembled += decoded.Delta.PartialJSON
-			}
-		}
-	}
-
-	if starts != 1 {
-		t.Fatalf("content_block_start count = %d, want 1; sequence = %v", starts, eventNames(events))
-	}
-	if fragments != 2 || reassembled != `{"x":1}` {
-		t.Fatalf("reassembled %d fragments to %q, want 2 fragments making {\"x\":1}", fragments, reassembled)
-	}
-}
-
-// Identity can arrive a delta later than the block was opened. Treating that as a
-// new call splits one tool call across two blocks, each holding a piece of an
-// unparseable JSON object.
-func TestWriteAnthropicStreamLateToolCallIdentityStaysOneBlock(t *testing.T) {
-	cases := []struct {
-		name     string
-		upstream []string
-		wantJSON string
-	}{
-		{
-			// The emitted id is synthesized from the name here, so comparing the
-			// real id against it later must not look like a different call.
-			name: "id_arrives_after_name",
-			upstream: []string{
-				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"f","arguments":"{\"a\":"}}]}}]}`,
-				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"1}"}}]}}]}`,
-			},
-			wantJSON: `{"a":1}`,
-		},
-		{
-			name: "name_arrives_after_id",
-			upstream: []string{
-				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"{\"a\":"}}]}}]}`,
-				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"1}"}}]}}]}`,
-			},
-			wantJSON: `{"a":1}`,
-		},
-		{
-			// A name streamed in pieces must not read as a sequence of new calls.
-			name: "name_streamed_in_fragments",
-			upstream: []string{
-				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_","arguments":"{\"a\":"}}]}}]}`,
-				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"1}"}}]}}]}`,
-			},
-			wantJSON: `{"a":1}`,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			upstream := strings.Join(append(tc.upstream, `data: [DONE]`, ``), "\n\n")
-
-			events, _ := writeAnthropicStream(t, upstream, "")
-
-			starts := 0
-			fragments := map[int]string{}
-			for _, event := range events {
-				switch event.name {
-				case anthropic.EventContentBlockStart:
-					starts++
-				case anthropic.EventContentBlockDelta:
-					decoded := decodeEvent(t, event)
-					if decoded.Delta != nil && decoded.Delta.Type == anthropic.DeltaTypeInputJSON {
-						fragments[*decoded.Index] += decoded.Delta.PartialJSON
-					}
-				}
-			}
-
-			if starts != 1 {
-				t.Fatalf("content_block_start count = %d, want 1; sequence = %v", starts, eventNames(events))
-			}
-			if fragments[0] != tc.wantJSON {
-				t.Fatalf("block 0 reassembled to %q, want %q", fragments[0], tc.wantJSON)
-			}
-			if !json.Valid([]byte(fragments[0])) {
-				t.Fatalf("block 0 input %q is not valid JSON", fragments[0])
-			}
-		})
-	}
-}
-
-// A call whose arguments are still mid-object cannot have ended, so even a
-// genuinely different id must not close it and leave invalid JSON behind.
-func TestWriteAnthropicStreamIncompleteArgumentsBlockNewCall(t *testing.T) {
-	upstream := strings.Join([]string{
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"first","arguments":"{\"a\":"}}]}}]}`,
-		``,
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"second","arguments":"1}"}}]}}]}`,
-		``,
-		`data: [DONE]`,
-		``,
-	}, "\n")
-
-	events, _ := writeAnthropicStream(t, upstream, "")
-
 	starts := 0
 	reassembled := ""
 	for _, event := range events {
@@ -572,47 +469,296 @@ func TestWriteAnthropicStreamIncompleteArgumentsBlockNewCall(t *testing.T) {
 	}
 
 	if starts != 1 {
-		t.Fatalf("content_block_start count = %d, want 1 while arguments are incomplete", starts)
+		t.Fatalf("content_block_start count = %d, want 1; sequence = %v", starts, eventNames(events))
 	}
-	if !json.Valid([]byte(reassembled)) {
-		t.Fatalf("reassembled input %q is not valid JSON", reassembled)
+	if reassembled != `{"x":1}` {
+		t.Fatalf("input = %q, want the fragments joined into {\"x\":1}", reassembled)
 	}
 }
 
-// Once a call's arguments parse, a differing id does mean a new call.
-func TestWriteAnthropicStreamCompletedArgumentsAllowNewCall(t *testing.T) {
-	upstream := strings.Join([]string{
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
-		``,
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
-		``,
-		`data: [DONE]`,
-		``,
-	}, "\n")
+// toolBlock is one emitted tool_use block, reassembled from the event stream.
+type toolBlock struct {
+	index int
+	id    string
+	name  string
+	input string
+}
 
-	events, _ := writeAnthropicStream(t, upstream, "")
+// collectToolBlocks reassembles the tool_use blocks from a stream and checks the
+// structural invariants the SDK accumulators enforce: block indices must start at
+// 0 and rise by exactly one, every block must be stopped exactly once, and no
+// delta may address a block that was never started.
+func collectToolBlocks(t *testing.T, events []sseEvent) []toolBlock {
+	t.Helper()
 
-	var startIDs []string
-	fragments := map[int]string{}
+	var blocks []toolBlock
+	byIndex := map[int]int{}
+	stops := map[int]int{}
+
 	for _, event := range events {
 		decoded := decodeEvent(t, event)
 		switch event.name {
 		case anthropic.EventContentBlockStart:
-			startIDs = append(startIDs, decoded.ContentBlock.ID)
-		case anthropic.EventContentBlockDelta:
-			if decoded.Delta != nil && decoded.Delta.Type == anthropic.DeltaTypeInputJSON {
-				fragments[*decoded.Index] += decoded.Delta.PartialJSON
+			if decoded.Index == nil {
+				t.Fatalf("content_block_start without index: %s", event.data)
 			}
+			if *decoded.Index != len(byIndex) {
+				t.Fatalf("content_block_start index = %d, want %d (indices must be gapless and ascending)", *decoded.Index, len(byIndex))
+			}
+			byIndex[*decoded.Index] = -1
+			if decoded.ContentBlock != nil && decoded.ContentBlock.Type == anthropic.BlockTypeToolUse {
+				byIndex[*decoded.Index] = len(blocks)
+				blocks = append(blocks, toolBlock{
+					index: *decoded.Index,
+					id:    decoded.ContentBlock.ID,
+					name:  decoded.ContentBlock.Name,
+				})
+			}
+		case anthropic.EventContentBlockDelta:
+			slot, started := byIndex[*decoded.Index]
+			if !started {
+				t.Fatalf("content_block_delta for index %d, which was never started", *decoded.Index)
+			}
+			if slot >= 0 && decoded.Delta != nil && decoded.Delta.Type == anthropic.DeltaTypeInputJSON {
+				blocks[slot].input += decoded.Delta.PartialJSON
+			}
+		case anthropic.EventContentBlockStop:
+			if _, started := byIndex[*decoded.Index]; !started {
+				t.Fatalf("content_block_stop for index %d, which was never started", *decoded.Index)
+			}
+			stops[*decoded.Index]++
 		}
 	}
 
-	if !equalStrings(startIDs, []string{"call_1", "call_2"}) {
-		t.Fatalf("block ids = %v, want [call_1 call_2]", startIDs)
-	}
-	for index, want := range map[int]string{0: `{"a":1}`, 1: `{"b":2}`} {
-		if fragments[index] != want {
-			t.Fatalf("block %d = %q, want %q", index, fragments[index], want)
+	for index := range byIndex {
+		if stops[index] != 1 {
+			t.Fatalf("block %d stopped %d times, want exactly 1", index, stops[index])
 		}
+	}
+
+	// Every emitted tool block must carry input the client can decode.
+	for _, block := range blocks {
+		input := block.input
+		if input == "" {
+			input = "{}"
+		}
+		if !json.Valid([]byte(input)) {
+			t.Fatalf("block %d input %q is not valid JSON", block.index, input)
+		}
+	}
+
+	return blocks
+}
+
+// A tool call's id and name may arrive in any delta, and a name may itself be
+// split. None of that may produce a second block, drop the name, or leave a block
+// holding a fragment: identity is only committed once the arguments parse.
+func TestWriteAnthropicStreamToolCallIdentityArrivesLate(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream []string
+		want     toolBlock
+	}{
+		{
+			name: "id_arrives_after_name",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"f","arguments":"{\"a\":"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"1}"}}]}}]}`,
+			},
+			want: toolBlock{id: "call_1", name: "f", input: `{"a":1}`},
+		},
+		{
+			// The name shows up only in the second delta, after arguments began.
+			name: "name_arrives_after_id",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"{\"a\":"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"1}"}}]}}]}`,
+			},
+			want: toolBlock{id: "call_1", name: "f", input: `{"a":1}`},
+		},
+		{
+			name: "name_streamed_in_fragments_with_arguments",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_","arguments":"{\"a\":"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"1}"}}]}}]}`,
+			},
+			want: toolBlock{id: "toolu_get_weather", name: "get_weather", input: `{"a":1}`},
+		},
+		{
+			// The same shape with no arguments at all, so nothing gates on the
+			// arguments parsing. The name still has to arrive whole.
+			name: "name_streamed_in_fragments_without_arguments",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather"}}]}}]}`,
+			},
+			want: toolBlock{id: "toolu_get_weather", name: "get_weather", input: ""},
+		},
+		{
+			// A repeated full name is a repeat, not a fragment.
+			name: "name_repeated_in_full",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"only","arguments":"{\"a\":"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"only","arguments":"1}"}}]}}]}`,
+			},
+			want: toolBlock{id: "call_1", name: "only", input: `{"a":1}`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := strings.Join(append(tc.upstream, `data: [DONE]`, ``), "\n\n")
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+			if len(blocks) != 1 {
+				t.Fatalf("emitted %d tool blocks, want 1: %#v", len(blocks), blocks)
+			}
+			got := blocks[0]
+			if got.id != tc.want.id || got.name != tc.want.name || got.input != tc.want.input {
+				t.Fatalf("block = %#v, want id %q name %q input %q", got, tc.want.id, tc.want.name, tc.want.input)
+			}
+		})
+	}
+}
+
+// Distinct calls arriving at the same upstream index must become distinct blocks,
+// including when upstream reuses an id or a name.
+func TestWriteAnthropicStreamDistinctCallsAtSameIndex(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream []string
+		want     []toolBlock
+	}{
+		{
+			name: "different_ids",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"a","arguments":"{\"x\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"b","arguments":"{\"y\":2}"}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "a", input: `{"x":1}`},
+				{id: "c1", name: "b", input: `{"y":2}`},
+			},
+		},
+		{
+			// Upstream reuses one id across two genuinely different calls. Round 2
+			// caught this on the differing name; round 3 regressed it by letting the
+			// id win. Buffering settles it: the first call is emitted as soon as its
+			// arguments parse, so the slot is free.
+			name: "repeated_id_different_names",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"a","arguments":"{\"x\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"b","arguments":"{\"y\":2}"}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "a", input: `{"x":1}`},
+				{id: "c0", name: "b", input: `{"y":2}`},
+			},
+		},
+		{
+			name: "no_identity_at_all",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"y\":2}"}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "toolu_localaik", name: "", input: `{"x":1}`},
+				{id: "toolu_localaik", name: "", input: `{"y":2}`},
+			},
+		},
+		{
+			name: "three_calls_one_index",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"a","arguments":"{\"x\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"b","arguments":"{\"y\":2}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2","type":"function","function":{"name":"c","arguments":"{\"z\":3}"}}]}}]}`,
+			},
+			want: []toolBlock{
+				{id: "c0", name: "a", input: `{"x":1}`},
+				{id: "c1", name: "b", input: `{"y":2}`},
+				{id: "c2", name: "c", input: `{"z":3}`},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := strings.Join(append(tc.upstream, `data: [DONE]`, ``), "\n\n")
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+			if len(blocks) != len(tc.want) {
+				t.Fatalf("emitted %d tool blocks, want %d: %#v", len(blocks), len(tc.want), blocks)
+			}
+			for i, want := range tc.want {
+				if blocks[i].id != want.id || blocks[i].name != want.name || blocks[i].input != want.input {
+					t.Fatalf("block %d = %#v, want id %q name %q input %q", i, blocks[i], want.id, want.name, want.input)
+				}
+			}
+		})
+	}
+}
+
+// Arguments that never parse must not reach the client as a broken input, and the
+// call must not vanish either.
+func TestWriteAnthropicStreamTruncatedToolArgumentsBecomeEmptyObject(t *testing.T) {
+	cases := map[string]string{
+		"truncated_object": `{"a":`,
+		"trailing_comma":   `{"a":1,`,
+		"only_brace":       `{`,
+	}
+
+	for name, arguments := range cases {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(arguments)
+			if err != nil {
+				t.Fatalf("encode arguments: %v", err)
+			}
+			upstream := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":` + string(encoded) + `}}]}}]}` +
+				"\n\n" + "data: [DONE]\n\n"
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+			if len(blocks) != 1 {
+				t.Fatalf("emitted %d tool blocks, want 1: %#v", len(blocks), blocks)
+			}
+			if blocks[0].input != "" {
+				t.Fatalf("input = %q, want no delta so the block keeps its empty object", blocks[0].input)
+			}
+			if blocks[0].name != "f" {
+				t.Fatalf("block = %#v, want the call preserved", blocks[0])
+			}
+		})
+	}
+}
+
+// json.Valid accepts bare scalars, so a complete-but-not-object argument payload
+// must not be forwarded as a tool input.
+func TestWriteAnthropicStreamScalarToolArgumentsBecomeEmptyObject(t *testing.T) {
+	for _, arguments := range []string{`null`, `1`, `"text"`, `[1,2]`, `true`} {
+		t.Run(arguments, func(t *testing.T) {
+			encoded, err := json.Marshal(arguments)
+			if err != nil {
+				t.Fatalf("encode arguments: %v", err)
+			}
+			upstream := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":` + string(encoded) + `}}]}}]}` +
+				"\n\n" + "data: [DONE]\n\n"
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+			if len(blocks) != 1 {
+				t.Fatalf("emitted %d tool blocks, want 1: %#v", len(blocks), blocks)
+			}
+			input := blocks[0].input
+			if input == "" {
+				input = "{}"
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal([]byte(input), &decoded); err != nil {
+				t.Fatalf("tool input %q does not decode as an object: %v", input, err)
+			}
+		})
 	}
 }
 

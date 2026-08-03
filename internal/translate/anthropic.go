@@ -455,11 +455,17 @@ func openAIToolCallsToAnthropicBlocks(calls []openaip.ToolCall) []anthropic.Cont
 // object rather than being passed through. Clients decode input into a struct
 // and would fail on the other shapes.
 func anthropicToolInput(arguments string) json.RawMessage {
-	trimmed := strings.TrimSpace(arguments)
-	if trimmed == "" || !strings.HasPrefix(trimmed, "{") || !json.Valid([]byte(trimmed)) {
+	if !isJSONObject(arguments) {
 		return json.RawMessage(`{}`)
 	}
-	return json.RawMessage(trimmed)
+	return json.RawMessage(strings.TrimSpace(arguments))
+}
+
+// isJSONObject reports whether value is a complete JSON object. Note that
+// json.Valid on its own is not enough: it also accepts bare scalars and arrays.
+func isJSONObject(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed))
 }
 
 func anthropicRoleToOpenAI(role string) string {

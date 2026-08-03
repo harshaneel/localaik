@@ -236,6 +236,9 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 		name   string
 		chunks []string
 		want   []map[string]any
+		// wantNames is checked when set: an input that decodes is useless if the
+		// client cannot tell which tool to call.
+		wantNames []string
 	}{
 		{
 			// No `index` at all: two calls that must not collapse into one block.
@@ -288,6 +291,47 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 			},
 			want: []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
 		},
+		{
+			// The name arrives only after arguments have begun.
+			name: "name_arrives_after_id",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"arguments":"{\"a\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"only","arguments":"1}"}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}},
+			wantNames: []string{"only"},
+		},
+		{
+			// A name split across deltas has to reach the client whole; a client
+			// cannot invoke "get_".
+			name: "name_streamed_in_fragments",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{\"a\":1}"}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}},
+			wantNames: []string{"get_weather"},
+		},
+		{
+			// Upstream reuses one id for two genuinely different calls.
+			name: "repeated_id_two_calls",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+			wantNames: []string{"first", "second"},
+		},
+		{
+			// Arguments upstream never finished. The call must survive with a
+			// decodable input rather than breaking the stream.
+			name: "truncated_arguments",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"only","arguments":"{\"a\":"}}]}}]}`,
+			},
+			want:      []map[string]any{{}},
+			wantNames: []string{"only"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -324,6 +368,7 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 			}
 
 			var inputs []map[string]any
+			var names []string
 			for _, block := range accumulated.Content {
 				toolUse, ok := block.AsAny().(anthropicsdk.ToolUseBlock)
 				if !ok {
@@ -331,9 +376,10 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 				}
 				var input map[string]any
 				if err := json.Unmarshal(toolUse.Input, &input); err != nil {
-					t.Fatalf("tool input %s does not decode: %v", toolUse.Input, err)
+					t.Fatalf("tool input %s does not decode as an object: %v", toolUse.Input, err)
 				}
 				inputs = append(inputs, input)
+				names = append(names, toolUse.Name)
 			}
 
 			if len(inputs) != len(tc.want) {
@@ -346,6 +392,17 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 				for key, value := range want {
 					if inputs[i][key] != value {
 						t.Fatalf("tool input %d = %#v, want %#v", i, inputs[i], want)
+					}
+				}
+			}
+
+			if tc.wantNames != nil {
+				if len(names) != len(tc.wantNames) {
+					t.Fatalf("tool names = %v, want %v", names, tc.wantNames)
+				}
+				for i, want := range tc.wantNames {
+					if names[i] != want {
+						t.Fatalf("tool names = %v, want %v", names, tc.wantNames)
 					}
 				}
 			}
