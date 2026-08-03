@@ -239,6 +239,9 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 		// wantNames is checked when set: an input that decodes is useless if the
 		// client cannot tell which tool to call.
 		wantNames []string
+		// wantUniqueIDs asserts the blocks do not share a tool_use id, which a
+		// client's tool_result blocks key on.
+		wantUniqueIDs bool
 	}{
 		{
 			// No `index` at all: two calls that must not collapse into one block.
@@ -332,6 +335,79 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 			want:      []map[string]any{{}},
 			wantNames: []string{"only"},
 		},
+		{
+			// A padding delta after the arguments are already whole. This must not
+			// become a second call: arguments parsing is not the end of a call.
+			name: "trailing_empty_arguments_delta",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"only","arguments":"{\"a\":1}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"only","arguments":""}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}},
+			wantNames: []string{"only"},
+		},
+		{
+			// The same, anonymous, which previously produced a nameless phantom call.
+			name: "trailing_anonymous_delta",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"only","arguments":"{\"a\":1}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}},
+			wantNames: []string{"only"},
+		},
+		{
+			// The name arrives only after the arguments are whole.
+			name: "name_after_complete_arguments",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"arguments":"{\"a\":1}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"only","arguments":""}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}},
+			wantNames: []string{"only"},
+		},
+		{
+			// A zero-argument call whose name is split across deltas.
+			name: "no_argument_call_with_fragmented_name",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"get_","arguments":"{}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":""}}]}}]}`,
+			},
+			want:      []map[string]any{{}},
+			wantNames: []string{"get_weather"},
+		},
+		{
+			// Upstream starts a later index, then comes back to finish the earlier one.
+			name: "resumes_lower_index_after_higher",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+			wantNames: []string{"first", "second"},
+		},
+		{
+			// A higher index seen before a lower one still has to come out in order.
+			name: "higher_index_arrives_first",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}}]}}]}`,
+			},
+			want:      []map[string]any{{"a": float64(1)}, {"b": float64(2)}},
+			wantNames: []string{"first", "second"},
+		},
+		{
+			// Two parallel calls to the same tool with no ids at all.
+			name: "same_tool_twice_without_ids",
+			chunks: []string{
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{\"p\":\"a.txt\"}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"read_file","arguments":"{\"p\":\"b.txt\"}"}}]}}]}`,
+			},
+			want:          []map[string]any{{"p": "a.txt"}, {"p": "b.txt"}},
+			wantNames:     []string{"read_file", "read_file"},
+			wantUniqueIDs: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -368,7 +444,7 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 			}
 
 			var inputs []map[string]any
-			var names []string
+			var names, ids []string
 			for _, block := range accumulated.Content {
 				toolUse, ok := block.AsAny().(anthropicsdk.ToolUseBlock)
 				if !ok {
@@ -380,6 +456,7 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 				}
 				inputs = append(inputs, input)
 				names = append(names, toolUse.Name)
+				ids = append(ids, toolUse.ID)
 			}
 
 			if len(inputs) != len(tc.want) {
@@ -404,6 +481,16 @@ func TestSDKAnthropicMessagesStreamingToolCallShapes(t *testing.T) {
 					if names[i] != want {
 						t.Fatalf("tool names = %v, want %v", names, tc.wantNames)
 					}
+				}
+			}
+
+			if tc.wantUniqueIDs {
+				seen := map[string]bool{}
+				for _, id := range ids {
+					if seen[id] {
+						t.Fatalf("tool_use ids = %v, want them unique", ids)
+					}
+					seen[id] = true
 				}
 			}
 		})

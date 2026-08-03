@@ -3,6 +3,7 @@ package translate
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -240,14 +241,13 @@ func TestWriteAnthropicStreamTextThenToolCallUsesSequentialBlocks(t *testing.T) 
 
 	events, _ := writeAnthropicStream(t, upstream, "")
 
-	// The tool call's arguments are already an empty object, which
-	// content_block_start carries, so no input_json_delta is needed.
 	want := []string{
 		anthropic.EventMessageStart,
 		anthropic.EventContentBlockStart, // text, index 0
 		anthropic.EventContentBlockDelta,
 		anthropic.EventContentBlockStop,  // index 0 closes before the tool block opens
 		anthropic.EventContentBlockStart, // tool_use, index 1
+		anthropic.EventContentBlockDelta,
 		anthropic.EventContentBlockStop,
 		anthropic.EventMessageDelta,
 		anthropic.EventMessageStop,
@@ -272,7 +272,16 @@ func TestWriteAnthropicStreamTextThenToolCallUsesSequentialBlocks(t *testing.T) 
 		t.Fatalf("tool input = %s, want an empty object", toolStart.ContentBlock.Input)
 	}
 
-	toolStop := decodeEvent(t, events[5])
+	// A tool_use always gets at least one input_json_delta, as the real API sends.
+	toolDelta := decodeEvent(t, events[5])
+	if toolDelta.Delta == nil || toolDelta.Delta.Type != anthropic.DeltaTypeInputJSON {
+		t.Fatalf("tool delta = %s, want input_json_delta", events[5].data)
+	}
+	if toolDelta.Delta.PartialJSON != `{}` {
+		t.Fatalf("tool partial_json = %q, want an empty object", toolDelta.Delta.PartialJSON)
+	}
+
+	toolStop := decodeEvent(t, events[6])
 	if toolStop.Index == nil || *toolStop.Index != 1 {
 		t.Fatalf("tool content_block_stop index = %v, want 1", toolStop.Index)
 	}
@@ -484,67 +493,94 @@ type toolBlock struct {
 	input string
 }
 
-// collectToolBlocks reassembles the tool_use blocks from a stream and checks the
-// structural invariants the SDK accumulators enforce: block indices must start at
-// 0 and rise by exactly one, every block must be stopped exactly once, and no
-// delta may address a block that was never started.
+// collectToolBlocks reassembles the tool_use blocks from a stream and asserts the
+// invariants that hold for every stream, whatever upstream sent:
+//
+//   - block indices start at 0 and rise by exactly one, which the SDK accumulators
+//     enforce on content_block_start;
+//   - a delta or stop only ever addresses a block that was started and not yet
+//     stopped, since a delta after a stop silently corrupts the accumulated input;
+//   - every block is stopped exactly once;
+//   - every tool_use block carries a decodable JSON object as its input, and a
+//     `name` field, without which a client cannot invoke anything;
+//   - tool_use ids are unique, since a client's tool_result blocks key on them.
 func collectToolBlocks(t *testing.T, events []sseEvent) []toolBlock {
 	t.Helper()
 
 	var blocks []toolBlock
-	byIndex := map[int]int{}
+	slots := map[int]int{}
 	stops := map[int]int{}
+
+	requireIndex := func(event sseEvent, decoded anthropic.StreamEvent) int {
+		if decoded.Index == nil {
+			t.Fatalf("%s without index: %s", event.name, event.data)
+		}
+		return *decoded.Index
+	}
 
 	for _, event := range events {
 		decoded := decodeEvent(t, event)
 		switch event.name {
 		case anthropic.EventContentBlockStart:
-			if decoded.Index == nil {
-				t.Fatalf("content_block_start without index: %s", event.data)
+			index := requireIndex(event, decoded)
+			if index != len(slots) {
+				t.Fatalf("content_block_start index = %d, want %d (indices must be gapless and ascending)", index, len(slots))
 			}
-			if *decoded.Index != len(byIndex) {
-				t.Fatalf("content_block_start index = %d, want %d (indices must be gapless and ascending)", *decoded.Index, len(byIndex))
-			}
-			byIndex[*decoded.Index] = -1
+			slots[index] = -1
 			if decoded.ContentBlock != nil && decoded.ContentBlock.Type == anthropic.BlockTypeToolUse {
-				byIndex[*decoded.Index] = len(blocks)
+				// The decode-side type omits an absent name, so the raw payload is
+				// what proves the required field was actually sent.
+				if !strings.Contains(event.data, `"name"`) {
+					t.Fatalf("tool_use content_block_start has no name field: %s", event.data)
+				}
+				slots[index] = len(blocks)
 				blocks = append(blocks, toolBlock{
-					index: *decoded.Index,
+					index: index,
 					id:    decoded.ContentBlock.ID,
 					name:  decoded.ContentBlock.Name,
 				})
 			}
 		case anthropic.EventContentBlockDelta:
-			slot, started := byIndex[*decoded.Index]
+			index := requireIndex(event, decoded)
+			slot, started := slots[index]
 			if !started {
-				t.Fatalf("content_block_delta for index %d, which was never started", *decoded.Index)
+				t.Fatalf("content_block_delta for index %d, which was never started", index)
+			}
+			if stops[index] > 0 {
+				t.Fatalf("content_block_delta for index %d after it was stopped", index)
 			}
 			if slot >= 0 && decoded.Delta != nil && decoded.Delta.Type == anthropic.DeltaTypeInputJSON {
 				blocks[slot].input += decoded.Delta.PartialJSON
 			}
 		case anthropic.EventContentBlockStop:
-			if _, started := byIndex[*decoded.Index]; !started {
-				t.Fatalf("content_block_stop for index %d, which was never started", *decoded.Index)
+			index := requireIndex(event, decoded)
+			if _, started := slots[index]; !started {
+				t.Fatalf("content_block_stop for index %d, which was never started", index)
 			}
-			stops[*decoded.Index]++
+			stops[index]++
 		}
 	}
 
-	for index := range byIndex {
+	for index := range slots {
 		if stops[index] != 1 {
 			t.Fatalf("block %d stopped %d times, want exactly 1", index, stops[index])
 		}
 	}
 
-	// Every emitted tool block must carry input the client can decode.
+	ids := map[string]bool{}
 	for _, block := range blocks {
 		input := block.input
 		if input == "" {
 			input = "{}"
 		}
-		if !json.Valid([]byte(input)) {
-			t.Fatalf("block %d input %q is not valid JSON", block.index, input)
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(input), &decoded); err != nil {
+			t.Fatalf("block %d input %q does not decode as an object: %v", block.index, input, err)
 		}
+		if ids[block.id] {
+			t.Fatalf("block %d reuses tool_use id %q", block.index, block.id)
+		}
+		ids[block.id] = true
 	}
 
 	return blocks
@@ -592,7 +628,7 @@ func TestWriteAnthropicStreamToolCallIdentityArrivesLate(t *testing.T) {
 				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_"}}]}}]}`,
 				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather"}}]}}]}`,
 			},
-			want: toolBlock{id: "toolu_get_weather", name: "get_weather", input: ""},
+			want: toolBlock{id: "toolu_get_weather", name: "get_weather", input: "{}"},
 		},
 		{
 			// A repeated full name is a repeat, not a fragment.
@@ -622,6 +658,135 @@ func TestWriteAnthropicStreamToolCallIdentityArrivesLate(t *testing.T) {
 	}
 }
 
+// A tool call's arguments becoming parseable does not mean the call has ended:
+// upstream may send further deltas for the same index. Treating parseability as
+// the end fabricates a second, usually nameless, call out of those deltas.
+func TestWriteAnthropicStreamTrailingToolCallDeltas(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream []string
+		want     toolBlock
+	}{
+		{
+			// A padding delta repeating the identity with no arguments.
+			name: "empty_arguments_with_identity",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":"{\"a\":"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":"1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":""}}]}}]}`,
+			},
+			want: toolBlock{id: "c0", name: "f", input: `{"a":1}`},
+		},
+		{
+			// The same but anonymous, which previously became a nameless phantom call.
+			name: "empty_arguments_anonymous",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}`,
+			},
+			want: toolBlock{id: "c0", name: "f", input: `{"a":1}`},
+		},
+		{
+			name: "whitespace_arguments",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"  "}}]}}]}`,
+			},
+			want: toolBlock{id: "c0", name: "f", input: `{"a":1}`},
+		},
+		{
+			// The name only shows up after the arguments are already whole.
+			name: "name_after_complete_arguments",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"arguments":"{\"a\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":""}}]}}]}`,
+			},
+			want: toolBlock{id: "c0", name: "f", input: `{"a":1}`},
+		},
+		{
+			// A tool delta after the finish_reason chunk.
+			name: "delta_after_finish_reason",
+			upstream: []string{
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}}]}`,
+				`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}`,
+			},
+			want: toolBlock{id: "c0", name: "f", input: `{"a":1}`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := strings.Join(append(tc.upstream, `data: [DONE]`, ``), "\n\n")
+
+			blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+			if len(blocks) != 1 {
+				t.Fatalf("emitted %d tool blocks, want 1: %#v", len(blocks), blocks)
+			}
+			got := blocks[0]
+			if got.id != tc.want.id || got.name != tc.want.name || got.input != tc.want.input {
+				t.Fatalf("block = %#v, want id %q name %q input %q", got, tc.want.id, tc.want.name, tc.want.input)
+			}
+		})
+	}
+}
+
+// Two parallel calls to the same tool with no upstream ids must not share an id:
+// the client's tool_result blocks key on it.
+func TestWriteAnthropicStreamDeduplicatesSynthesizedToolIDs(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{\"p\":\"a.txt\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"read_file","arguments":"{\"p\":\"b.txt\"}"}}]}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	// collectToolBlocks fails on duplicate ids, so reaching the assertions is
+	// already most of the check.
+	blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+	if len(blocks) != 2 {
+		t.Fatalf("emitted %d tool blocks, want 2: %#v", len(blocks), blocks)
+	}
+	if blocks[0].name != "read_file" || blocks[1].name != "read_file" {
+		t.Fatalf("blocks = %#v, want both named read_file", blocks)
+	}
+	if blocks[0].id == blocks[1].id {
+		t.Fatalf("both blocks use id %q", blocks[0].id)
+	}
+}
+
+// A no-argument tool call followed by text must still be emitted before the text,
+// so the blocks keep upstream's order.
+func TestWriteAnthropicStreamNoArgumentToolCallPrecedesText(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"noargs","arguments":""}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"content":"trailing text"}}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	events, _ := writeAnthropicStream(t, upstream, "")
+
+	var order []string
+	for _, event := range events {
+		if event.name != anthropic.EventContentBlockStart {
+			continue
+		}
+		decoded := decodeEvent(t, event)
+		order = append(order, decoded.ContentBlock.Type)
+	}
+
+	if !equalStrings(order, []string{anthropic.BlockTypeToolUse, anthropic.BlockTypeText}) {
+		t.Fatalf("block order = %v, want the tool call before the text", order)
+	}
+}
+
 // Distinct calls arriving at the same upstream index must become distinct blocks,
 // including when upstream reuses an id or a name.
 func TestWriteAnthropicStreamDistinctCallsAtSameIndex(t *testing.T) {
@@ -642,10 +807,9 @@ func TestWriteAnthropicStreamDistinctCallsAtSameIndex(t *testing.T) {
 			},
 		},
 		{
-			// Upstream reuses one id across two genuinely different calls. Round 2
-			// caught this on the differing name; round 3 regressed it by letting the
-			// id win. Buffering settles it: the first call is emitted as soon as its
-			// arguments parse, so the slot is free.
+			// Upstream reuses one id across two genuinely different calls. The second
+			// block's id is disambiguated, since a client replying with duplicate
+			// tool_use_ids would be rejected on the next turn.
 			name: "repeated_id_different_names",
 			upstream: []string{
 				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"a","arguments":"{\"x\":1}"}}]}}]}`,
@@ -653,10 +817,11 @@ func TestWriteAnthropicStreamDistinctCallsAtSameIndex(t *testing.T) {
 			},
 			want: []toolBlock{
 				{id: "c0", name: "a", input: `{"x":1}`},
-				{id: "c0", name: "b", input: `{"y":2}`},
+				{id: "c0_2", name: "b", input: `{"y":2}`},
 			},
 		},
 		{
+			// Nothing to derive an id from, so the synthesized ids must still differ.
 			name: "no_identity_at_all",
 			upstream: []string{
 				`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1}"}}]}}]}`,
@@ -664,7 +829,7 @@ func TestWriteAnthropicStreamDistinctCallsAtSameIndex(t *testing.T) {
 			},
 			want: []toolBlock{
 				{id: "toolu_localaik", name: "", input: `{"x":1}`},
-				{id: "toolu_localaik", name: "", input: `{"y":2}`},
+				{id: "toolu_localaik_2", name: "", input: `{"y":2}`},
 			},
 		},
 		{
@@ -723,8 +888,8 @@ func TestWriteAnthropicStreamTruncatedToolArgumentsBecomeEmptyObject(t *testing.
 			if len(blocks) != 1 {
 				t.Fatalf("emitted %d tool blocks, want 1: %#v", len(blocks), blocks)
 			}
-			if blocks[0].input != "" {
-				t.Fatalf("input = %q, want no delta so the block keeps its empty object", blocks[0].input)
+			if blocks[0].input != "{}" {
+				t.Fatalf("input = %q, want the unparseable arguments replaced with an empty object", blocks[0].input)
 			}
 			if blocks[0].name != "f" {
 				t.Fatalf("block = %#v, want the call preserved", blocks[0])
@@ -1057,6 +1222,159 @@ func TestOpenAIToolCallsToAnthropicBlocksSkipsUnusableCalls(t *testing.T) {
 	}
 	if blocks[0].ID != "keep" || blocks[0].Name != "ok" {
 		t.Fatalf("block = %#v", blocks[0])
+	}
+}
+
+// TestWriteAnthropicStreamToolCallShapeMatrix is the regression net for the
+// streaming state machine. It walks every combination of the ways upstreams
+// legitimately differ — where a tool call's identity appears, whether an index is
+// sent, how finely arguments are fragmented, whether a padding delta trails the
+// call, whether text surrounds it — and asserts the same thing throughout: one
+// block per intended call, each with the right name and input.
+//
+// Four review rounds each found a shape that broke a state machine whose own
+// tests passed, because every fixture happened to share an assumption. Enumerating
+// the dimensions is what stops that recurring.
+func TestWriteAnthropicStreamToolCallShapeMatrix(t *testing.T) {
+	type call struct {
+		id   string
+		name string
+		args string
+	}
+
+	calls := []call{
+		{id: "c0", name: "first", args: `{"a":1}`},
+		{id: "c1", name: "second", args: `{"b":"two"}`},
+	}
+
+	// splitInto cuts s into n roughly equal pieces, so arguments arrive fragmented
+	// the way a real token stream delivers them.
+	splitInto := func(s string, n int) []string {
+		if n <= 1 || len(s) < n {
+			return []string{s}
+		}
+		pieces := make([]string, 0, n)
+		size := len(s) / n
+		for i := 0; i < n; i++ {
+			start := i * size
+			end := start + size
+			if i == n-1 {
+				end = len(s)
+			}
+			pieces = append(pieces, s[start:end])
+		}
+		return pieces
+	}
+
+	identityModes := []string{"with_first_fragment", "id_first_then_name", "name_first_then_id", "repeated_on_every_fragment"}
+	indexModes := []string{"correct_index", "always_zero", "omitted"}
+
+	for _, identity := range identityModes {
+		for _, indexMode := range indexModes {
+			for _, fragments := range []int{1, 2, 3} {
+				for _, padding := range []bool{false, true} {
+					for _, withText := range []bool{false, true} {
+						name := fmt.Sprintf("%s/%s/frags=%d/pad=%v/text=%v", identity, indexMode, fragments, padding, withText)
+
+						t.Run(name, func(t *testing.T) {
+							// An upstream that omits the index or pins it to 0 gives no way to
+							// separate two calls except a fresh argument object, so a call with
+							// no arguments of its own cannot be told apart. Every call here has
+							// arguments, so the shapes remain distinguishable.
+							var chunks []string
+
+							emit := func(callIndex int, delta string) {
+								indexField := ""
+								switch indexMode {
+								case "correct_index":
+									indexField = fmt.Sprintf(`"index":%d,`, callIndex)
+								case "always_zero":
+									indexField = `"index":0,`
+								}
+								chunks = append(chunks, `data: {"choices":[{"delta":{"tool_calls":[{`+indexField+delta+`}]}}]}`)
+							}
+
+							if withText {
+								chunks = append(chunks, `data: {"choices":[{"delta":{"content":"before"}}]}`)
+							}
+
+							for i, c := range calls {
+								pieces := splitInto(c.args, fragments)
+								for p, piece := range pieces {
+									encoded, err := json.Marshal(piece)
+									if err != nil {
+										t.Fatalf("encode fragment: %v", err)
+									}
+
+									id, toolName := "", ""
+									switch identity {
+									case "with_first_fragment":
+										if p == 0 {
+											id, toolName = c.id, c.name
+										}
+									case "id_first_then_name":
+										if p == 0 {
+											id = c.id
+										}
+										if p == min(1, len(pieces)-1) {
+											toolName = c.name
+										}
+									case "name_first_then_id":
+										if p == 0 {
+											toolName = c.name
+										}
+										if p == min(1, len(pieces)-1) {
+											id = c.id
+										}
+									case "repeated_on_every_fragment":
+										id, toolName = c.id, c.name
+									}
+
+									parts := ""
+									if id != "" {
+										parts += fmt.Sprintf(`"id":%q,"type":"function",`, id)
+									}
+									if toolName != "" {
+										parts += fmt.Sprintf(`"function":{"name":%q,"arguments":%s}`, toolName, encoded)
+									} else {
+										parts += fmt.Sprintf(`"function":{"arguments":%s}`, encoded)
+									}
+									emit(i, parts)
+								}
+
+								if padding {
+									emit(i, `"function":{"arguments":""}`)
+								}
+							}
+
+							if withText {
+								chunks = append(chunks, `data: {"choices":[{"delta":{"content":"after"}}]}`)
+							}
+							chunks = append(chunks,
+								`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+								`data: [DONE]`,
+								``,
+							)
+
+							upstream := strings.Join(chunks, "\n\n")
+							blocks := collectToolBlocks(t, mustWriteStream(t, upstream))
+
+							if len(blocks) != len(calls) {
+								t.Fatalf("emitted %d tool blocks, want %d\nblocks: %#v\nupstream:\n%s", len(blocks), len(calls), blocks, upstream)
+							}
+							for i, want := range calls {
+								if blocks[i].name != want.name {
+									t.Fatalf("block %d name = %q, want %q\nupstream:\n%s", i, blocks[i].name, want.name, upstream)
+								}
+								if blocks[i].input != want.args {
+									t.Fatalf("block %d input = %q, want %q\nupstream:\n%s", i, blocks[i].input, want.args, upstream)
+								}
+							}
+						})
+					}
+				}
+			}
+		}
 	}
 }
 

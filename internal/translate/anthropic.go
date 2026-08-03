@@ -430,6 +430,7 @@ func anthropicToolChoiceToOpenAI(choice *anthropic.ToolChoice) any {
 
 func openAIToolCallsToAnthropicBlocks(calls []openaip.ToolCall) []anthropic.ContentBlock {
 	blocks := make([]anthropic.ContentBlock, 0, len(calls))
+	ids := newToolUseIDs()
 	for _, call := range calls {
 		if call.Type != "" && call.Type != "function" {
 			continue
@@ -439,12 +440,38 @@ func openAIToolCallsToAnthropicBlocks(calls []openaip.ToolCall) []anthropic.Cont
 		}
 		blocks = append(blocks, anthropic.ContentBlock{
 			Type:  anthropic.BlockTypeToolUse,
-			ID:    anthropicToolUseID(call.ID, call.Function.Name),
+			ID:    ids.assign(call.ID, call.Function.Name),
 			Name:  call.Function.Name,
 			Input: anthropicToolInput(call.Function.Arguments),
 		})
 	}
 	return blocks
+}
+
+// toolUseIDs hands out tool_use ids that are unique within one message.
+//
+// An upstream that sends no tool-call ids leaves nothing to derive them from but
+// the tool name, so two parallel calls to the same tool would otherwise share an
+// id. The client's tool_result blocks would then carry duplicate tool_use_ids,
+// which the real API rejects on the next turn, breaking an agent loop a turn
+// after the mistake was made.
+type toolUseIDs struct {
+	used map[string]int
+}
+
+func newToolUseIDs() *toolUseIDs {
+	return &toolUseIDs{used: make(map[string]int)}
+}
+
+func (t *toolUseIDs) assign(id, name string) string {
+	candidate := anthropicToolUseID(id, name)
+
+	seen := t.used[candidate]
+	t.used[candidate] = seen + 1
+	if seen == 0 {
+		return candidate
+	}
+	return fmt.Sprintf("%s_%d", candidate, seen+1)
 }
 
 // anthropicToolInput normalises OpenAI's stringified arguments into the JSON

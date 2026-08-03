@@ -237,13 +237,16 @@ type ContentBlockStartEvent struct {
 }
 
 // StreamContentBlock is the content_block payload of a content_block_start
-// event. Text is a pointer so a text block can emit `"text": ""` (which the
-// Messages API always does) while a tool_use block omits the field entirely.
+// event. Text and Name are pointers so each block type emits exactly the fields
+// the Messages API defines for it, including ones that are required but empty: a
+// text block sends `"text": ""` and a tool_use block sends `"name"` even when
+// upstream never supplied one. Strict clients reject a block missing a required
+// field, so omitting them is not a safe simplification.
 type StreamContentBlock struct {
 	Type  string          `json:"type"`
 	Text  *string         `json:"text,omitempty"`
 	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
+	Name  *string         `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
 }
 
@@ -259,7 +262,7 @@ func ToolUseStreamBlock(id, name string) StreamContentBlock {
 	return StreamContentBlock{
 		Type:  BlockTypeToolUse,
 		ID:    id,
-		Name:  name,
+		Name:  &name,
 		Input: json.RawMessage(`{}`),
 	}
 }
