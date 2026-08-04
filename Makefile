@@ -10,7 +10,7 @@ GOFILES := $(shell find cmd internal integration -name '*.go' -type f | sort)
 
 export GOCACHE
 
-.PHONY: help fmt fmt-check lint test-unit test-integration test build docker-build docker-up docker-down
+.PHONY: help fmt fmt-check lint test-unit test-integration test build docker-build docker-build-proxy docker-up docker-down
 
 help:
 	@printf '%s\n' \
@@ -22,6 +22,7 @@ help:
 		'make test                   Run lint, unit tests, and integration tests' \
 		'make build                  Build the localaik binary' \
 		'make docker-build           Build the Docker image' \
+		'make docker-build-proxy      Build the proxy-only image' \
 		'make docker-up              Start the Docker image on PORT' \
 		'make docker-down            Stop and remove the Docker container'
 
@@ -47,6 +48,9 @@ build:
 
 docker-build:
 	@docker build -t "$(IMAGE)" .
+
+docker-build-proxy:
+	@docker build --target proxy -t "$(IMAGE)-proxy" .
 
 docker-up:
 	@if [[ "$(BUILD_IMAGE)" == "1" ]]; then $(MAKE) docker-build IMAGE="$(IMAGE)"; fi
