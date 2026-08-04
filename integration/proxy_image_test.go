@@ -71,13 +71,14 @@ func TestProxyImageRoundTripsAllProtocols(t *testing.T) {
 	waitForHealth(t, "http://127.0.0.1:18097/health")
 
 	cases := []struct {
-		name string
-		path string
-		body string
+		name        string
+		path        string
+		body        string
+		expectedKey string
 	}{
-		{"openai", "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`},
-		{"gemini", "/v1beta/models/m:generateContent", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`},
-		{"anthropic", "/v1/messages", `{"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`},
+		{"openai", "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, "choices"},
+		{"gemini", "/v1beta/models/m:generateContent", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, "candidates"},
+		{"anthropic", "/v1/messages", `{"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, "content"},
 	}
 
 	for _, tc := range cases {
@@ -95,8 +96,15 @@ func TestProxyImageRoundTripsAllProtocols(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			if len(decoded) == 0 {
-				t.Fatal("empty response body")
+			// Each protocol reshapes the stub's fixed OpenAI-shaped payload
+			// differently; the expected key catches a misrouted handler.
+			if _, ok := decoded[tc.expectedKey]; !ok {
+				t.Fatalf("response missing %q key, got keys %v", tc.expectedKey, mapKeys(decoded))
+			}
+			if tc.name == "anthropic" {
+				if role, _ := decoded["role"].(string); role != "assistant" {
+					t.Fatalf("role = %q, want assistant", role)
+				}
 			}
 		})
 	}
@@ -107,6 +115,14 @@ func TestProxyImageRoundTripsAllProtocols(t *testing.T) {
 	if got != "integration-secret" {
 		t.Fatalf("upstream saw X-Proxy-Token = %q, want integration-secret", got)
 	}
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func waitForHealth(t *testing.T, url string) {
