@@ -22,10 +22,15 @@ func TestUpstreamAuthHeaderReachesEveryUpstreamPath(t *testing.T) {
 	}{
 		{"openai_chat", http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`},
 		{"openai_models", http.MethodGet, "/v1/models", ""},
+		{"openai_completions", http.MethodPost, "/v1/completions", `{"prompt":"hello"}`},
+		{"openai_model_get", http.MethodGet, "/v1/models/gpt-4", ""},
 		{"gemini_generate", http.MethodPost, "/v1beta/models/m:generateContent", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`},
 		{"gemini_count_tokens", http.MethodPost, "/v1beta/models/m:countTokens", `{"contents":[{"parts":[{"text":"hi"}]}]}`},
+		{"gemini_models_list", http.MethodGet, "/v1beta/models", ""},
+		{"gemini_model_get", http.MethodGet, "/v1beta/models/gemini-2.5-pro", ""},
 		{"anthropic_messages", http.MethodPost, "/v1/messages", `{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`},
 		{"anthropic_count_tokens", http.MethodPost, "/v1/messages/count_tokens", `{"messages":[{"role":"user","content":"hi"}]}`},
+		{"health", http.MethodGet, "/health", ""},
 	}
 
 	for _, tc := range cases {
@@ -45,6 +50,10 @@ func TestUpstreamAuthHeaderReachesEveryUpstreamPath(t *testing.T) {
 					writeJSON(w, http.StatusOK, map[string]any{"tokens": []int{1, 2}})
 				case "/v1/models":
 					writeJSON(w, http.StatusOK, openaip.ModelList{Object: "list", Data: []openaip.Model{{ID: "m"}}})
+				case "/v1/models/gpt-4":
+					writeJSON(w, http.StatusOK, openaip.Model{ID: "gpt-4"})
+				case "/health":
+					w.WriteHeader(http.StatusOK)
 				default:
 					writeJSON(w, http.StatusOK, openaip.ChatCompletionResponse{
 						Choices: []openaip.Choice{{Message: openaip.Message{Content: "ok"}, FinishReason: "stop"}},
@@ -143,8 +152,14 @@ func TestUpstreamAuthHeaderOnStreamingRoute(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
 	if seen != "upstream-secret" {
 		t.Fatalf("X-Proxy-Token = %q on the streaming route, want the proxy credential", seen)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("data:")) {
+		t.Fatalf("response body missing data: frame; got %s", rec.Body.String())
 	}
 }
 
