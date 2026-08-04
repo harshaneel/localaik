@@ -11,7 +11,7 @@ A local compatibility server for the Gemini, OpenAI, and Anthropic APIs. Run one
 
 ## Motivation
 
-Testing code that calls Gemini, OpenAI, or Anthropic is painful: real API calls are slow, cost money, and need network access. localaik gives you a single Docker container that speaks all three protocols backed by a local model — no API key, no internet, deterministic enough for CI.
+Testing code that calls Gemini, OpenAI, or Anthropic is painful: real API calls are slow, cost money, and need network access. localaik gives you a single Docker container that speaks all three protocols backed by a local model, or the `proxy` tag if you already run your own model server. No API key, no internet, deterministic enough for CI.
 
 ## Architecture
 
@@ -133,9 +133,11 @@ client := anthropic.NewClient(
 | --------------------- | ------------------ | ---------- |
 | `latest`, `gemma3-4b` | Gemma 3 4B Q4_K_M  | ~3 GB      |
 | `gemma3-12b`          | Gemma 3 12B Q4_K_M | ~7 GB      |
+| `proxy`               | none (you supply)  | ~41 MB     |
 
 
-Version-pinned tags follow the pattern `v0.1.1-gemma3-4b`, `v0.1.1-gemma3-12b`.
+Version-pinned tags follow the pattern `v0.1.1-gemma3-4b`, `v0.1.1-gemma3-12b`,
+`v0.1.1-proxy`. The `proxy` tag is never published as `latest`.
 
 ## Tuning (v0.1.3 onwards)
 
@@ -181,6 +183,41 @@ services:
 | `LK_CONT_BATCHING` | 0 (off)         | Continuous batching (`1` to enable) |
 | `LK_MLOCK`         | 0 (off)         | Lock model in RAM (`1` to enable)   |
 
+
+## Bring your own model server (`:proxy`)
+
+If you already run llama.cpp, vLLM, or anything else that speaks the OpenAI
+chat-completions API, the `proxy` tag gives you the translation layer alone. It
+contains no model and no inference engine.
+
+```bash
+docker run -d -p 8090:8090 \
+  -e LK_UPSTREAM=http://llama.internal:8080/v1 \
+  gokhalh/localaik:proxy
+```
+
+| Env var | Default | Description |
+| --- | --- | --- |
+| `LK_UPSTREAM` | `http://127.0.0.1:8080/v1` | Base URL of your model server |
+| `LK_UPSTREAM_AUTH_HEADER` | unset | A full header line sent to your server, for example `Authorization: Bearer abc123` |
+| `PORT` | `8090` | Port localaik listens on |
+
+`LK_UPSTREAM_AUTH_HEADER` is sent only to your upstream. Credentials that
+clients send to localaik are still discarded and never forwarded.
+
+`/health` returns 503 until your upstream answers, so existing healthchecks and
+CI wait loops work unchanged.
+
+### Security
+
+`:proxy` has a different risk profile from the model-bundled tags. Those keep
+llama.cpp bound to localhost inside the container, so the only thing reachable
+is a disposable local model. `:proxy` forwards into infrastructure you care
+about, and localaik does not authenticate its callers by design.
+
+**Anyone who can reach port 8090 can use your model server without
+credentials.** Bind to localhost and do not publish the port on a shared
+network. localaik is a testing tool, not a gateway.
 
 ## Implemented routes
 
