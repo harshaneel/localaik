@@ -96,8 +96,7 @@ func TestProxyImageRoundTripsAllProtocols(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			// Each protocol reshapes the stub's fixed OpenAI-shaped payload
-			// differently; the expected key catches a misrouted handler.
+			// The expected key catches a response shaped by the wrong handler.
 			if _, ok := decoded[tc.expectedKey]; !ok {
 				t.Fatalf("response missing %q key, got keys %v", tc.expectedKey, mapKeys(decoded))
 			}
