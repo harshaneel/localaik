@@ -397,7 +397,7 @@ docker build \
   --build-arg MMPROJ_SHA256=... \
   -t gokhalh/localaik:custom .
 
-# Proxy only, no model or inference engine (make docker-build-proxy)
+# Proxy only, no model or inference engine
 docker build --target proxy -t gokhalh/localaik:proxy .
 ```
 
