@@ -11,7 +11,7 @@ A local compatibility server for the Gemini, OpenAI, and Anthropic APIs. Run one
 
 ## Motivation
 
-Testing code that calls Gemini, OpenAI, or Anthropic is painful: real API calls are slow, cost money, and need network access. localaik gives you a single Docker container that speaks all three protocols backed by a local model, or the `proxy` tag if you already run your own model server. No API key, no internet, deterministic enough for CI.
+Testing code that calls Gemini, OpenAI, or Anthropic is painful: real API calls are slow, cost money, and need network access. localaik gives you a single Docker container that speaks all three protocols backed by a local model, or the `proxy` tag if you already run your own model server. The model-bundled tags need no API key and no internet, and are deterministic enough for CI.
 
 ## Architecture
 
@@ -399,7 +399,7 @@ docker build \
 ## Limitations
 
 - Intended for tests and development, not production
-- Image size is dominated by model weights
+- Image size is dominated by model weights (not applicable to the `proxy` tag, which ships none)
 - Cold starts can take tens of seconds while the model loads
 - PDF rendering adds latency per page
 
