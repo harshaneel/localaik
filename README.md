@@ -191,7 +191,7 @@ chat-completions API, the `proxy` tag gives you the translation layer alone. It
 contains no model and no inference engine.
 
 ```bash
-docker run -d -p 8090:8090 \
+docker run -d -p 127.0.0.1:8090:8090 \
   -e LK_UPSTREAM=http://llama.internal:8080/v1 \
   gokhalh/localaik:proxy
 ```
@@ -203,7 +203,9 @@ docker run -d -p 8090:8090 \
 | `PORT` | `8090` | Port localaik listens on |
 
 `LK_UPSTREAM_AUTH_HEADER` is sent only to your upstream. Credentials that
-clients send to localaik are still discarded and never forwarded.
+clients send to localaik are still discarded and never forwarded. It is attached
+only to requests whose host matches `LK_UPSTREAM`, and while it is set a
+redirect from your upstream is returned to the caller rather than followed.
 
 `/health` returns 503 until your upstream answers, so existing healthchecks and
 CI wait loops work unchanged.
@@ -394,6 +396,9 @@ docker build \
   --build-arg MMPROJ_URL=... \
   --build-arg MMPROJ_SHA256=... \
   -t gokhalh/localaik:custom .
+
+# Proxy only, no model or inference engine (make docker-build-proxy)
+docker build --target proxy -t gokhalh/localaik:proxy .
 ```
 
 ## Limitations

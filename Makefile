@@ -22,7 +22,7 @@ help:
 		'make test                   Run lint, unit tests, and integration tests' \
 		'make build                  Build the localaik binary' \
 		'make docker-build           Build the Docker image' \
-		'make docker-build-proxy      Build the proxy-only image' \
+		'make docker-build-proxy     Build the proxy-only image' \
 		'make docker-up              Start the Docker image on PORT' \
 		'make docker-down            Stop and remove the Docker container'
 
