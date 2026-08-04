@@ -51,7 +51,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.UpstreamAuthHeader != "" {
 		clone := *client
-		clone.Transport = newUpstreamAuthTransport(clone.Transport, cfg.UpstreamAuthHeader)
+		clone.Transport = newUpstreamAuthTransport(clone.Transport, cfg.UpstreamAuthHeader, parsed.Hostname())
+		// Scoped here so the bundled-model images keep the stdlib default; a
+		// followed redirect would send prompt content to the target.
+		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
 		client = &clone
 	}
 
