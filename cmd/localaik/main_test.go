@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/harshaneel/localaik/internal/server"
+)
 
 func TestResolveFlagDefaultPrefersEnv(t *testing.T) {
 	t.Setenv("LK_TEST_VALUE", "from-env")
@@ -24,38 +28,13 @@ func TestResolveFlagDefaultUnsetFallsBack(t *testing.T) {
 	}
 }
 
-func TestIsValidAuthHeaderUnset(t *testing.T) {
-	if got := isValidAuthHeader(""); got != false {
-		t.Fatalf("isValidAuthHeader(\"\") = %v, want false", got)
+// The startup warning must be driven by the same predicate the transport uses;
+// server.ValidUpstreamAuthHeader owns the table of cases.
+func TestStartupWarningUsesTheServerPredicate(t *testing.T) {
+	if server.ValidUpstreamAuthHeader("Authorization: Bearer token123") != true {
+		t.Fatal("a valid header line was rejected")
 	}
-}
-
-func TestIsValidAuthHeaderValid(t *testing.T) {
-	if got := isValidAuthHeader("Authorization: Bearer token123"); got != true {
-		t.Fatalf("isValidAuthHeader(\"Authorization: Bearer token123\") = %v, want true", got)
-	}
-}
-
-func TestIsValidAuthHeaderNoColon(t *testing.T) {
-	if got := isValidAuthHeader("InvalidHeader NoColon"); got != false {
-		t.Fatalf("isValidAuthHeader(\"InvalidHeader NoColon\") = %v, want false", got)
-	}
-}
-
-func TestIsValidAuthHeaderEmptyName(t *testing.T) {
-	if got := isValidAuthHeader(": value"); got != false {
-		t.Fatalf("isValidAuthHeader(\": value\") = %v, want false", got)
-	}
-}
-
-func TestIsValidAuthHeaderEmptyValue(t *testing.T) {
-	if got := isValidAuthHeader("Name:"); got != false {
-		t.Fatalf("isValidAuthHeader(\"Name:\") = %v, want false", got)
-	}
-}
-
-func TestIsValidAuthHeaderWhitespaceOnly(t *testing.T) {
-	if got := isValidAuthHeader("  :  "); got != false {
-		t.Fatalf("isValidAuthHeader(\"  :  \") = %v, want false", got)
+	if server.ValidUpstreamAuthHeader("InvalidHeader NoColon") != false {
+		t.Fatal("a header line with no colon was accepted")
 	}
 }
