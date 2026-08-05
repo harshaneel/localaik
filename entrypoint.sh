@@ -1,13 +1,6 @@
 #!/bin/sh
 set -eu
 
-cleanup() {
-  jobs -p | xargs -r kill 2>/dev/null || true
-  wait || true
-}
-
-trap 'cleanup; exit 0' INT TERM
-
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/app/llama-server}"
 if [ ! -x "${LLAMA_SERVER_BIN}" ]; then
   if command -v llama-server >/dev/null 2>&1; then
@@ -35,23 +28,45 @@ SERVER_ARGS="${SERVER_ARGS} --ctx-size ${LK_CTX_SIZE:-8192}"
 [ "${LK_CONT_BATCHING:-0}" = "1" ] && SERVER_ARGS="${SERVER_ARGS} --cont-batching"
 [ "${LK_MLOCK:-0}" = "1" ]         && SERVER_ARGS="${SERVER_ARGS} --mlock"
 
+LLAMA_PID=""
+PROXY_PID=""
+
+# Armed before either child exists, and iterating so an unset PID cannot make
+# kill swallow the other one.
+trap 'for p in ${LLAMA_PID} ${PROXY_PID}; do kill "${p}" 2>/dev/null || true; done; exit 0' INT TERM
+
 # shellcheck disable=SC2086
 "${LLAMA_SERVER_BIN}" ${SERVER_ARGS} &
+LLAMA_PID=$!
 
-echo "localaik: loading model..."
-tries=0
-until curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; do
-  tries=$((tries + 1))
-  if [ "${tries}" -ge 120 ]; then
-    echo "localaik: model failed to load after 120s" >&2
-    cleanup
-    exit 1
-  fi
+localaik --port "${PORT:-8090}" --upstream "http://127.0.0.1:8080/v1" &
+PROXY_PID=$!
+
+echo "localaik: supervising; /health reports 503 until the model is ready"
+
+while kill -0 "${LLAMA_PID}" 2>/dev/null && kill -0 "${PROXY_PID}" 2>/dev/null; do
   sleep 1
 done
 
-echo "localaik: model ready"
-echo "localaik: listening on port ${PORT:-8090}"
-exec localaik \
-  --port "${PORT:-8090}" \
-  --upstream "http://127.0.0.1:8080/v1"
+if kill -0 "${LLAMA_PID}" 2>/dev/null; then
+  died="localaik"
+  dead_pid="${PROXY_PID}"
+  survivor="${LLAMA_PID}"
+else
+  died="llama-server"
+  dead_pid="${LLAMA_PID}"
+  survivor="${PROXY_PID}"
+fi
+
+kill "${survivor}" 2>/dev/null || true
+# Waited so its last log lines reach docker logs before the container tears down.
+wait "${survivor}" 2>/dev/null || true
+
+status=0
+wait "${dead_pid}" || status=$?
+if [ "${status}" -eq 0 ]; then
+  status=1
+fi
+
+echo "localaik: ${died} exited with status ${status}, stopping the container" >&2
+exit "${status}"

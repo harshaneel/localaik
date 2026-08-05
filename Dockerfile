@@ -41,7 +41,7 @@ RUN chmod +x /entrypoint.sh
 
 ENV PORT=8090
 
-HEALTHCHECK --interval=5s --timeout=3s --start-period=60s \
+HEALTHCHECK --interval=5s --timeout=3s --start-period=180s \
   CMD curl -sf http://127.0.0.1:${PORT:-8090}/health || exit 1
 
 EXPOSE 8090
