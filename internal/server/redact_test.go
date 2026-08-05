@@ -96,7 +96,11 @@ func TestUpstreamErrorResponsesDoNotLeakCredentials(t *testing.T) {
 		body   string
 	}{
 		{"openai", http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`},
+		{"openai_models_list", http.MethodGet, "/v1/models", ""},
+		{"openai_model_get", http.MethodGet, "/v1/models/m", ""},
 		{"gemini", http.MethodPost, "/v1beta/models/m:generateContent", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`},
+		{"gemini_models_list", http.MethodGet, "/v1beta/models", ""},
+		{"gemini_model_get", http.MethodGet, "/v1beta/models/m", ""},
 		{"anthropic", http.MethodPost, "/v1/messages", `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`},
 		{"gemini_count_tokens", http.MethodPost, "/v1beta/models/m:countTokens", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`},
 	}
