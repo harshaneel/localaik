@@ -15,7 +15,7 @@ func (s *Server) handleGeminiModelsList(w http.ResponseWriter, r *http.Request) 
 	var upstream openaip.ModelList
 	status, body, err := s.fetchUpstreamJSON(r, s.upstreamModelsURL, &upstream)
 	if err != nil {
-		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream: %v", err))
+		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream %s", s.upstreamDisplay))
 		return
 	}
 	if status >= http.StatusBadRequest {
@@ -35,7 +35,7 @@ func (s *Server) handleGeminiModelGet(w http.ResponseWriter, r *http.Request) {
 	var upstream openaip.Model
 	status, body, err := s.fetchUpstreamJSON(r, s.upstreamModelsURL+"/"+modelName, &upstream)
 	if err != nil {
-		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream: %v", err))
+		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream %s", s.upstreamDisplay))
 		return
 	}
 	if status >= http.StatusBadRequest {

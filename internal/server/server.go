@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"path"
@@ -30,6 +29,7 @@ type Server struct {
 	upstreamModelsURL   string
 	upstreamTokenizeURL string
 	upstreamHealthURL   string
+	upstreamDisplay     string
 }
 
 func New(cfg Config) (*Server, error) {
@@ -37,9 +37,10 @@ func New(cfg Config) (*Server, error) {
 		cfg.UpstreamBaseURL = "http://127.0.0.1:8080/v1"
 	}
 
+	// The raw URL can carry credentials, so its parse error is not wrapped.
 	parsed, err := url.Parse(cfg.UpstreamBaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse upstream URL: %w", err)
+		return nil, errors.New("upstream URL is not parseable")
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil, errors.New("upstream URL must include scheme and host")
@@ -69,6 +70,7 @@ func New(cfg Config) (*Server, error) {
 	return &Server{
 		client:              client,
 		pdfRenderer:         renderer,
+		upstreamDisplay:     RedactUpstream(cfg.UpstreamBaseURL),
 		upstreamChatURL:     resolveURLPath(parsed, "chat/completions"),
 		upstreamCompletions: resolveURLPath(parsed, "completions"),
 		upstreamModelsURL:   resolveURLPath(parsed, "models"),
@@ -117,13 +119,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "upstream": s.upstreamDisplay})
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "upstream": s.upstreamDisplay})
 		return
 	}
 
@@ -141,6 +143,20 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
+}
+
+// RedactUpstream reduces an upstream URL to scheme, host and path, so a value
+// carrying credentials in userinfo or a query string can be logged and served
+// on /health without leaking them. An unparseable or hostless URL, such as the
+// opaque "http:user:pass@host" form, collapses to a constant rather than
+// echoing back.
+func RedactUpstream(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "invalid"
+	}
+	safe := url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path}
+	return safe.String()
 }
 
 func resolveURLPath(base *url.URL, extra string) string {

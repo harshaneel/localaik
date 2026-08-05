@@ -46,7 +46,7 @@ func (s *Server) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Requ
 
 	resp, err := s.client.Do(upstreamReq)
 	if err != nil {
-		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream: %v", err))
+		gemini.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream %s", s.upstreamDisplay))
 		return
 	}
 	defer resp.Body.Close()

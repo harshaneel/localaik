@@ -47,7 +47,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	resp, err := s.client.Do(upstreamReq)
 	if err != nil {
-		anthropic.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream: %v", err))
+		anthropic.WriteError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach upstream %s", s.upstreamDisplay))
 		return
 	}
 	defer resp.Body.Close()
