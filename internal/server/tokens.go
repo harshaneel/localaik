@@ -36,7 +36,7 @@ func (s *Server) countUpstreamTokens(r *http.Request, text string) (count int, u
 
 	resp, doErr := s.client.Do(req)
 	if doErr != nil {
-		return 0, 0, nil, &upstreamError{http.StatusBadGateway, fmt.Sprintf("failed to reach upstream: %v", doErr)}
+		return 0, 0, nil, &upstreamError{http.StatusBadGateway, fmt.Sprintf("failed to reach upstream %s", s.upstreamDisplay)}
 	}
 	defer resp.Body.Close()
 

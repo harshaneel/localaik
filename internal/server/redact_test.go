@@ -17,8 +17,12 @@ func TestRedactUpstream(t *testing.T) {
 		want string
 	}{
 		{"no userinfo is returned unchanged", "http://llama.internal:8080/v1", "http://llama.internal:8080/v1"},
-		{"password is removed", "http://user:secret@llama.internal:8080/v1", "http://redacted@llama.internal:8080/v1"},
-		{"username alone is removed", "http://user@llama.internal:8080/v1", "http://redacted@llama.internal:8080/v1"},
+		{"password is removed", "http://user:secret@llama.internal:8080/v1", "http://llama.internal:8080/v1"},
+		{"username alone is removed", "http://user@llama.internal:8080/v1", "http://llama.internal:8080/v1"},
+		{"password-only userinfo is removed", "http://:secret@llama.internal:8080/v1", "http://llama.internal:8080/v1"},
+		{"query string is dropped", "http://llama.internal:8080/v1?api_key=secret", "http://llama.internal:8080/v1"},
+		{"fragment is dropped", "http://llama.internal:8080/v1#token=secret", "http://llama.internal:8080/v1"},
+		{"opaque credential form does not echo back", "http:user:secret@llama.internal/v1", "invalid"},
 		{"unparseable input does not echo back", "http://[::1", "invalid"},
 	}
 
@@ -77,5 +81,48 @@ func TestHealthDoesNotLeakUpstreamCredentials(t *testing.T) {
 
 	if strings.Contains(rec.Body.String(), "supersecret") {
 		t.Fatalf("/health leaked the upstream password: %s", rec.Body.String())
+	}
+}
+
+// Go's http.Client redacts the password in a transport error but not a
+// username, so a key-as-username upstream would otherwise reach the caller when
+// a request fails. Every proxied route must scrub the whole upstream from the
+// error it returns.
+func TestUpstreamErrorResponsesDoNotLeakCredentials(t *testing.T) {
+	routes := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"openai", http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`},
+		{"gemini", http.MethodPost, "/v1beta/models/m:generateContent", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`},
+		{"anthropic", http.MethodPost, "/v1/messages", `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`},
+		{"gemini_count_tokens", http.MethodPost, "/v1beta/models/m:countTokens", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`},
+	}
+
+	srv, err := New(Config{
+		UpstreamBaseURL: "http://leakedkey@127.0.0.1:9/v1",
+		HTTPClient:      &http.Client{},
+		PDFRenderer:     pdf.RendererFunc(nil),
+	})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	for _, tc := range routes {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", rec.Code)
+			}
+			if strings.Contains(rec.Body.String(), "leakedkey") {
+				t.Fatalf("error response leaked the upstream username: %s", rec.Body.String())
+			}
+		})
 	}
 }

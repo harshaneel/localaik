@@ -32,6 +32,8 @@ func resolveUpstream(flagValue string, flagSet bool, env string) (string, string
 	return defaultUpstream, "default"
 }
 
+// requireEnv is an internal image marker set only in the proxy Dockerfile stage,
+// so any non-empty value arms the check.
 func upstreamRequiredButUnset(source, requireEnv string) bool {
 	return source == "default" && requireEnv != ""
 }
@@ -52,6 +54,9 @@ func main() {
 	flag.Parse()
 
 	upstream, source := resolveUpstream(*upstreamFlag, flagWasSet("upstream"), os.Getenv("LK_UPSTREAM"))
+	if upstream == "" {
+		log.Fatal("localaik: the upstream is set to an empty value; give a base URL that speaks the OpenAI chat completions API, for example http://llama.internal:8080/v1")
+	}
 	if upstreamRequiredButUnset(source, os.Getenv("LK_REQUIRE_UPSTREAM")) {
 		log.Fatal("localaik: LK_UPSTREAM is not set. This image has no model server of its own, so it needs the base URL of one that speaks the OpenAI chat completions API, for example http://llama.internal:8080/v1")
 	}

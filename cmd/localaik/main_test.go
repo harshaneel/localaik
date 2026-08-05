@@ -44,6 +44,9 @@ func TestResolveUpstream(t *testing.T) {
 		// Passing the default explicitly is how an operator opts into this
 		// container's own loopback, so it must not read as "default".
 		{"flag matching the default still counts as explicit", defaultUpstream, true, "", defaultUpstream, "flag"},
+		// An explicit empty flag must surface as empty so main rejects it,
+		// rather than falling through to the loopback default.
+		{"explicit empty flag stays empty", "", true, "http://env:2/v1", "", "flag"},
 	}
 
 	for _, tc := range tests {
