@@ -209,8 +209,9 @@ clients send to localaik are still discarded and never forwarded. It is attached
 only to requests whose host matches `LK_UPSTREAM`, and while it is set a
 redirect from your upstream is returned to the caller rather than followed.
 
-`/health` returns 503 until your upstream answers, so existing healthchecks and
-CI wait loops work unchanged.
+`/health` returns 503 until your upstream answers, so any wait loop that polls it
+for a 200 works unchanged. As with the model-bundled tags, the port opens before
+the upstream is reachable, so a TCP liveness check is not enough.
 
 ### Security
 
