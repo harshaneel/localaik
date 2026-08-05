@@ -4,6 +4,15 @@ WORKDIR /app
 COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /out/localaik ./cmd/localaik
 
+FROM alpine:3@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS proxy
+RUN apk add --no-cache ca-certificates poppler-utils tini
+COPY --from=proxy-builder /out/localaik /usr/local/bin/localaik
+ENV PORT=8090
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s \
+  CMD wget -q -O - "http://127.0.0.1:${PORT:-8090}/health" >/dev/null 2>&1 || exit 1
+EXPOSE 8090
+ENTRYPOINT ["tini", "--", "localaik"]
+
 # Upstream does not ship semver for the server image; pin by digest for reproducible multi-arch builds.
 # Logical tag at pin time: server (includes llama-server --mmproj for Gemma 3 vision). Bump digest to upgrade.
 FROM ghcr.io/ggml-org/llama.cpp@sha256:80910e898e5d9a6b46ca9d1b4674d3e15faf6d32b9692eb6011ccd34b2cb8a06

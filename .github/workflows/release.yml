@@ -53,16 +53,25 @@ jobs:
         include:
           - variant: gemma3-4b
             latest: true
+            target: ""
             model_url: https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/c536c4707e747055eecad7da65d46b6fb0ebaa79/gemma-3-4b-it-Q4_K_M.gguf
             model_sha256: be49949e48422e4547b00af14179a193d3777eea7fbbd7d6e1b0861304628a01
             mmproj_url: https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/d400f8ba80bfa661d94a756ea3b663db8b00da85/mmproj-model-f16.gguf
             mmproj_sha256: 8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb
           - variant: gemma3-12b
             latest: false
+            target: ""
             model_url: https://huggingface.co/lmstudio-community/gemma-3-12b-it-GGUF/resolve/ed6e7d1e8c65a0181cd45e3a194722d1c651f06e/gemma-3-12b-it-Q4_K_M.gguf
             model_sha256: 9610e3e07375303f6cd89086b496bcc1ab581177f52042eff536475a29283ba2
             mmproj_url: https://huggingface.co/lmstudio-community/gemma-3-12b-it-GGUF/resolve/785c151b0dabf00cfaff1421239fafdbb8e5995d/mmproj-model-f16.gguf
             mmproj_sha256: 30c02d056410848227001830866e0a269fcc28aaf8ca971bded494003de9f5a5
+          - variant: proxy
+            latest: false
+            target: proxy
+            model_url: ""
+            model_sha256: ""
+            mmproj_url: ""
+            mmproj_sha256: ""
     permissions:
       contents: read
     steps:
@@ -96,6 +105,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
