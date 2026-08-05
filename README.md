@@ -200,9 +200,16 @@ docker run -d -p 127.0.0.1:8090:8090 \
 
 | Env var | Default | Description |
 | --- | --- | --- |
-| `LK_UPSTREAM` | `http://127.0.0.1:8080/v1` | Base URL of your model server |
+| `LK_UPSTREAM` | none, required | Base URL of your model server |
 | `LK_UPSTREAM_AUTH_HEADER` | unset | A full header line sent to your server, for example `Authorization: Bearer abc123` |
 | `PORT` | `8090` | Port localaik listens on |
+
+`LK_UPSTREAM` is required here and the container exits if it is unset. The
+model-bundled tags default it to this container's own `127.0.0.1:8080`, which
+cannot work in an image with no inference engine, so `:proxy` refuses to start
+rather than reporting 503 forever. If you do want the container's own loopback,
+for example with `--network host`, set it explicitly to
+`http://127.0.0.1:8080/v1`.
 
 `LK_UPSTREAM_AUTH_HEADER` is sent only to your upstream. Credentials that
 clients send to localaik are still discarded and never forwarded. It is attached
@@ -211,7 +218,10 @@ redirect from your upstream is returned to the caller rather than followed.
 
 `/health` returns 503 until your upstream answers, so any wait loop that polls it
 for a 200 works unchanged. As with the model-bundled tags, the port opens before
-the upstream is reachable, so a TCP liveness check is not enough.
+the upstream is reachable, so a TCP liveness check is not enough. The 503 body
+names the upstream it could not reach, with any userinfo in the URL redacted.
+Since localaik authenticates none of its callers, treat that as one more reason
+not to publish the port on a shared network.
 
 ### Security
 

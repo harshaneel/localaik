@@ -8,6 +8,8 @@ FROM alpine:3@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec4349
 RUN apk add --no-cache ca-certificates poppler-utils tini
 COPY --from=proxy-builder /out/localaik /usr/local/bin/localaik
 ENV PORT=8090
+# No inference engine here, so the loopback default could never work.
+ENV LK_REQUIRE_UPSTREAM=1
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s \
   CMD wget -q -O - "http://127.0.0.1:${PORT:-8090}/health" >/dev/null 2>&1 || exit 1
 EXPOSE 8090

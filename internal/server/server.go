@@ -30,6 +30,7 @@ type Server struct {
 	upstreamModelsURL   string
 	upstreamTokenizeURL string
 	upstreamHealthURL   string
+	upstreamDisplay     string
 }
 
 func New(cfg Config) (*Server, error) {
@@ -69,6 +70,7 @@ func New(cfg Config) (*Server, error) {
 	return &Server{
 		client:              client,
 		pdfRenderer:         renderer,
+		upstreamDisplay:     RedactUpstream(cfg.UpstreamBaseURL),
 		upstreamChatURL:     resolveURLPath(parsed, "chat/completions"),
 		upstreamCompletions: resolveURLPath(parsed, "completions"),
 		upstreamModelsURL:   resolveURLPath(parsed, "models"),
@@ -117,13 +119,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "upstream": s.upstreamDisplay})
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "upstream": s.upstreamDisplay})
 		return
 	}
 
@@ -141,6 +143,20 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
+}
+
+// RedactUpstream strips any userinfo, so an upstream URL carrying credentials
+// can be logged and served on /health without leaking them.
+func RedactUpstream(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "invalid"
+	}
+	if parsed.User == nil {
+		return raw
+	}
+	parsed.User = url.User("redacted")
+	return parsed.String()
 }
 
 func resolveURLPath(base *url.URL, extra string) string {

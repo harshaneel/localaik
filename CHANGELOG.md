@@ -3,6 +3,17 @@
 Releases are cut by pushing a `v*` tag, which publishes the images to Docker Hub.
 Entries before v0.4.0 were reconstructed from git history.
 
+## Unreleased
+
+### Changed
+
+- **`:proxy` now requires `LK_UPSTREAM` and exits if it is unset.** It previously inherited a default of `http://127.0.0.1:8080/v1`, which is this container's own loopback and can never hold a model server in an image with no inference engine. Forgetting the variable produced a container that started cleanly and then failed every request. If you do want the container's own loopback, for example with `--network host`, set `LK_UPSTREAM=http://127.0.0.1:8080/v1` explicitly. The model-bundled tags are unaffected; their entrypoint passes `--upstream` directly.
+
+### Added
+
+- The resolved upstream and where it came from (flag, `LK_UPSTREAM`, or default) are logged at startup. Nothing previously reported the upstream, so a misconfiguration gave no signal at all.
+- The `/health` 503 body names the upstream it could not reach. Any userinfo in the URL is redacted, in that body and in the startup log.
+
 ## v0.4.0 (2026-08-04)
 
 ### Added
