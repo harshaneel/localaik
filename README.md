@@ -42,6 +42,8 @@ SDK requests hit the localaik proxy, which translates Gemini, OpenAI, or Anthrop
 docker run -d -p 8090:8090 gokhalh/localaik
 ```
 
+The port starts accepting connections before the model has loaded, so wait for `GET /health` to return 200 rather than for the port to open. A TCP liveness check will let requests through too early. Docker Compose users want `condition: service_healthy`.
+
 Or with Docker Compose:
 
 ```yaml
@@ -207,8 +209,9 @@ clients send to localaik are still discarded and never forwarded. It is attached
 only to requests whose host matches `LK_UPSTREAM`, and while it is set a
 redirect from your upstream is returned to the caller rather than followed.
 
-`/health` returns 503 until your upstream answers, so existing healthchecks and
-CI wait loops work unchanged.
+`/health` returns 503 until your upstream answers, so any wait loop that polls it
+for a 200 works unchanged. As with the model-bundled tags, the port opens before
+the upstream is reachable, so a TCP liveness check is not enough.
 
 ### Security
 
@@ -406,5 +409,6 @@ docker build --target proxy -t gokhalh/localaik:proxy .
 - Intended for tests and development, not production
 - Image size is dominated by model weights (not applicable to the `proxy` tag, which ships none)
 - Cold starts can take tens of seconds while the model loads
+- `/health` reports 503 during that window, and the container keeps running rather than exiting if the model never finishes loading
 - PDF rendering adds latency per page
 
