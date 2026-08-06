@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/harshaneel/localaik/internal/pdf"
@@ -77,9 +78,14 @@ func main() {
 		log.Fatalf("localaik: %v", err)
 	}
 
+	var reqLogger *log.Logger
+	if !strings.EqualFold(os.Getenv("LK_LOG"), "off") {
+		reqLogger = log.Default()
+	}
+
 	httpServer := &http.Server{
 		Addr:              ":" + *port,
-		Handler:           handler,
+		Handler:           server.WithRequestLog(handler, reqLogger),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

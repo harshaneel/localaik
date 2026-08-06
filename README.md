@@ -186,6 +186,18 @@ services:
 | `LK_MLOCK`         | 0 (off)         | Lock model in RAM (`1` to enable)   |
 
 
+## Logging
+
+localaik logs one line per request: method, path, status, and latency.
+
+```
+localaik  POST /v1/chat/completions  200  412ms
+localaik  POST /v1/messages  502 Bad Gateway  8ms
+```
+
+Set `LK_LOG=off` to silence per-request logging; the startup lines still print. Headers and request bodies are never logged, so credentials and prompts stay out of the log. Successful `/health` probes are skipped so the log stays focused on real traffic.
+
+
 ## Bring your own model server (`:proxy`)
 
 If you already run llama.cpp, vLLM, or anything else that speaks the OpenAI
