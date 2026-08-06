@@ -135,7 +135,7 @@ client := anthropic.NewClient(
 | --------------------- | ------------------ | ---------- |
 | `latest`, `gemma3-4b` | Gemma 3 4B Q4_K_M  | ~3 GB      |
 | `gemma3-12b`          | Gemma 3 12B Q4_K_M | ~7 GB      |
-| `proxy`               | none (you supply)  | ~41 MB     |
+| `proxy`               | none (you supply)  | ~46 MB     |
 
 
 Version-pinned tags follow the pattern `v0.1.1-gemma3-4b`, `v0.1.1-gemma3-12b`,

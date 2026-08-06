@@ -5,7 +5,9 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /out/localaik ./cmd/localaik
 
 FROM alpine:3@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS proxy
-RUN apk add --no-cache ca-certificates poppler-utils tini
+# font-liberation gives poppler the Base-14 fonts (Helvetica, Times, Courier);
+# without it, standard-font PDFs render as blank pages.
+RUN apk add --no-cache ca-certificates poppler-utils font-liberation tini
 COPY --from=proxy-builder /out/localaik /usr/local/bin/localaik
 ENV PORT=8090
 # No inference engine here, so the loopback default could never work.

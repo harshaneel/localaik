@@ -170,12 +170,28 @@ func TestProxyImageRoundTripsAllProtocols(t *testing.T) {
 		if err != nil {
 			t.Fatalf("rendered page was not valid base64: %v", err)
 		}
-		config, err := png.DecodeConfig(bytes.NewReader(page))
+		img, err := png.Decode(bytes.NewReader(page))
 		if err != nil {
 			t.Fatalf("rendered page was not a valid PNG: %v", err)
 		}
-		if config.Width == 0 || config.Height == 0 {
-			t.Fatalf("rendered page is %dx%d", config.Width, config.Height)
+		bounds := img.Bounds()
+		if bounds.Dx() == 0 || bounds.Dy() == 0 {
+			t.Fatalf("rendered page is %dx%d", bounds.Dx(), bounds.Dy())
+		}
+
+		// A page missing its fonts renders blank, so require some ink. This is
+		// what catches the proxy image shipping without the PDF base fonts.
+		ink := 0
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				r, g, b, _ := img.At(x, y).RGBA()
+				if r < 0x8000 && g < 0x8000 && b < 0x8000 {
+					ink++
+				}
+			}
+		}
+		if ink == 0 {
+			t.Fatal("rendered page has no dark pixels; the proxy image is likely missing PDF fonts (font-liberation)")
 		}
 	})
 
