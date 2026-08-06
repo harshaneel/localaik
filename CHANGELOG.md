@@ -3,7 +3,7 @@
 Releases are cut by pushing a `v*` tag, which publishes the images to Docker Hub.
 Entries before v0.4.0 were reconstructed from git history.
 
-## Unreleased
+## v0.4.1 (2026-08-06)
 
 ### Changed
 
