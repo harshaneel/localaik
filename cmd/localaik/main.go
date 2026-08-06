@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/harshaneel/localaik/internal/pdf"
@@ -36,6 +37,12 @@ func resolveUpstream(flagValue string, flagSet bool, env string) (string, string
 // so any non-empty value arms the check.
 func upstreamRequiredButUnset(source, requireEnv string) bool {
 	return source == "default" && requireEnv != ""
+}
+
+// requestLoggingEnabled reports whether per-request logging is on. Only "off"
+// disables it; every other value, including "0" and "false", leaves it on.
+func requestLoggingEnabled(env string) bool {
+	return !strings.EqualFold(env, "off")
 }
 
 func flagWasSet(name string) bool {
@@ -77,9 +84,14 @@ func main() {
 		log.Fatalf("localaik: %v", err)
 	}
 
+	var reqLogger *log.Logger
+	if requestLoggingEnabled(os.Getenv("LK_LOG")) {
+		reqLogger = log.Default()
+	}
+
 	httpServer := &http.Server{
 		Addr:              ":" + *port,
-		Handler:           handler,
+		Handler:           server.WithRequestLog(handler, reqLogger),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

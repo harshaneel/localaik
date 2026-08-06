@@ -13,6 +13,7 @@ Entries before v0.4.0 were reconstructed from git history.
 
 - The resolved upstream and where it came from (flag, `LK_UPSTREAM`, or default) are logged at startup. Nothing previously reported the upstream, so a misconfiguration gave no signal at all.
 - The `/health` 503 body names the upstream it could not reach.
+- One access line per request, tagged with the client protocol (`[openai]`, `[gemini]`, `[anthropic]`) and logging method, path, status, and latency. Headers and bodies are never logged, and successful `/health` probes are skipped. Set `LK_LOG=off` to silence it.
 
 ### Fixed
 
