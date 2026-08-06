@@ -3,6 +3,12 @@
 Releases are cut by pushing a `v*` tag, which publishes the images to Docker Hub.
 Entries before v0.4.0 were reconstructed from git history.
 
+## Unreleased
+
+### Fixed
+
+- The `proxy` image now renders PDFs that use the standard PDF fonts (Helvetica, Times, Courier). Alpine's `poppler-utils` ships without them, so those pages previously rasterized blank and the model saw nothing. Adds `font-liberation` (about 5 MB, so the image is now ~46 MB).
+
 ## v0.4.1 (2026-08-06)
 
 ### Changed

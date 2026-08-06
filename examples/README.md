@@ -10,7 +10,7 @@ Small, runnable samples that talk to **localaik** on `http://localhost:8090`. Us
    docker run -d -p 8090:8090 gokhalh/localaik
    ```
 
-   Or from the repo root: `make docker-up` (defaults to port `18090` — set `PORT=8090` if you want the examples unchanged).
+   Or from the repo root: `make docker-up` (defaults to port `18090`; set `PORT=8090` if you want the examples unchanged).
 
 2. Wait until the model is loaded (`GET /health` returns 200). The first start can take a while.
 
@@ -30,6 +30,8 @@ Small, runnable samples that talk to **localaik** on `http://localhost:8090`. Us
 | **Python**  | [python/gemini](python/gemini/main.py) | [python/openai](python/openai/main.py) | not yet | [python/gemini-structured](python/gemini-structured/main.py) |
 | **JavaScript** | [javascript/gemini](javascript/gemini/index.mjs) | [javascript/openai](javascript/openai/index.mjs) | not yet | [javascript/gemini-structured](javascript/gemini-structured/index.mjs) |
 | **Java**    | [java/gemini](java/gemini/Gemini.java) | [java/openai](java/openai/OpenAI.java) | not yet | [java/gemini-structured](java/gemini-structured/GeminiStructured.java) |
+
+**PDF parsing:** [go/gemini-pdf](go/gemini-pdf/main.go) sends a fake invoice PDF through Gemini and extracts its fields as structured JSON. It ships an embedded sample, so `go run main.go` works with no setup; pass a path to use your own PDF.
 
 ## Conventions
 
