@@ -90,6 +90,44 @@ func TestWithRequestLogPreservesFlusher(t *testing.T) {
 	}
 }
 
+func TestProtocolLabel(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{"/v1/chat/completions", "openai"},
+		{"/v1/completions", "openai"},
+		{"/v1/models", "openai"},
+		{"/v1/models/gemma", "openai"},
+		{"/v1/messages", "anthropic"},
+		{"/v1/messages/count_tokens", "anthropic"},
+		{"/v1beta/models", "gemini"},
+		{"/v1beta/models/gemma:generateContent", "gemini"},
+		{"/v1beta/models/gemma:streamGenerateContent", "gemini"},
+		{"/health", "-"},
+		{"/nope", "-"},
+	}
+	for _, tc := range tests {
+		if got := protocolLabel(tc.path); got != tc.want {
+			t.Errorf("protocolLabel(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestWithRequestLogTagsTheProtocol(t *testing.T) {
+	logger, buf := newTestLogger()
+	h := WithRequestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), logger)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+
+	if !strings.Contains(buf.String(), "[anthropic]") {
+		t.Fatalf("access line missing the protocol tag: %q", buf.String())
+	}
+}
+
 func TestWithRequestLogNilLoggerDisables(t *testing.T) {
 	called := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })

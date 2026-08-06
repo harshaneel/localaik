@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -37,14 +38,31 @@ func (l *requestLogger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		method, path := sanitizeLogField(r.Method), sanitizeLogField(r.URL.Path)
+		status := strconv.Itoa(rec.status)
 		if rec.status >= http.StatusBadRequest {
-			l.logger.Printf("localaik  %s %s  %d %s  %s", method, path, rec.status, http.StatusText(rec.status), dur)
-			return
+			status += " " + http.StatusText(rec.status)
 		}
-		l.logger.Printf("localaik  %s %s  %d  %s", method, path, rec.status, dur)
+		tag := "[" + protocolLabel(r.URL.Path) + "]"
+		l.logger.Printf("localaik  %-11s %s %s  %s  %s", tag, method, path, status, dur)
 	}()
 
 	l.next.ServeHTTP(rec, r)
+}
+
+// protocolLabel names the client API a request path belongs to, matching the
+// routing in ServeHTTP, so the access line shows which of the three protocols
+// was used.
+func protocolLabel(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/v1beta/"):
+		return "gemini"
+	case path == "/v1/messages" || strings.HasPrefix(path, "/v1/messages/"):
+		return "anthropic"
+	case strings.HasPrefix(path, "/v1/"):
+		return "openai"
+	default:
+		return "-"
+	}
 }
 
 // sanitizeLogField quotes a value that carries control characters, so a decoded
