@@ -87,6 +87,26 @@ func TestUpstreamRequiredButUnset(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingEnabled(t *testing.T) {
+	tests := []struct {
+		env  string
+		want bool
+	}{
+		{"", true},
+		{"off", false},
+		{"OFF", false},
+		{"Off", false},
+		{"on", true},
+		{"0", true},
+		{"false", true},
+	}
+	for _, tc := range tests {
+		if got := requestLoggingEnabled(tc.env); got != tc.want {
+			t.Errorf("requestLoggingEnabled(%q) = %v, want %v", tc.env, got, tc.want)
+		}
+	}
+}
+
 // The startup warning must be driven by the same predicate the transport uses;
 // server.ValidUpstreamAuthHeader owns the table of cases.
 func TestStartupWarningUsesTheServerPredicate(t *testing.T) {

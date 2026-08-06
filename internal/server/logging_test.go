@@ -132,6 +132,61 @@ func TestWithRequestLogLogsFailingHealthChecks(t *testing.T) {
 	}
 }
 
+// A decoded path can contain control characters, which must not reach the log
+// verbatim or a caller could forge log lines or inject terminal escapes.
+func TestWithRequestLogSanitizesControlCharsInPath(t *testing.T) {
+	logger, buf := newTestLogger()
+	h := WithRequestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), logger)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.URL.Path = "/evil\nlocalaik  GET /forged  500\x1b[31m"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	out := buf.String()
+	if strings.Count(out, "\n") != 1 {
+		t.Fatalf("expected exactly one newline (the log terminator), got %q", out)
+	}
+	if strings.ContainsRune(out, 0x1b) {
+		t.Fatalf("raw escape byte reached the log: %q", out)
+	}
+}
+
+// net/http honors only the first WriteHeader, so the log must record that one.
+func TestWithRequestLogRecordsFirstStatusOnly(t *testing.T) {
+	logger, buf := newTestLogger()
+	h := WithRequestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusBadGateway)
+	}), logger)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+
+	if !strings.Contains(buf.String(), "200") || strings.Contains(buf.String(), "502") {
+		t.Fatalf("expected the first status 200 to be logged, got %q", buf.String())
+	}
+}
+
+// A body write is an implicit 200, so a later WriteHeader must not change the
+// logged status away from what the client already received.
+func TestWithRequestLogImplicitStatusBeatsLaterWriteHeader(t *testing.T) {
+	logger, buf := newTestLogger()
+	h := WithRequestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "partial body")
+		w.WriteHeader(http.StatusBadGateway)
+	}), logger)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+
+	if !strings.Contains(buf.String(), "200") || strings.Contains(buf.String(), "502") {
+		t.Fatalf("expected the implicit 200 to be logged, got %q", buf.String())
+	}
+}
+
 // Nothing about the request headers, which can carry credentials, may reach the
 // access line.
 func TestWithRequestLogNeverLogsHeaders(t *testing.T) {

@@ -39,6 +39,12 @@ func upstreamRequiredButUnset(source, requireEnv string) bool {
 	return source == "default" && requireEnv != ""
 }
 
+// requestLoggingEnabled reports whether per-request logging is on. Only "off"
+// disables it; every other value, including "0" and "false", leaves it on.
+func requestLoggingEnabled(env string) bool {
+	return !strings.EqualFold(env, "off")
+}
+
 func flagWasSet(name string) bool {
 	set := false
 	flag.Visit(func(f *flag.Flag) {
@@ -79,7 +85,7 @@ func main() {
 	}
 
 	var reqLogger *log.Logger
-	if !strings.EqualFold(os.Getenv("LK_LOG"), "off") {
+	if requestLoggingEnabled(os.Getenv("LK_LOG")) {
 		reqLogger = log.Default()
 	}
 

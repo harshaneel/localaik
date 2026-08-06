@@ -191,11 +191,11 @@ services:
 localaik logs one line per request: method, path, status, and latency.
 
 ```
-localaik  POST /v1/chat/completions  200  412ms
-localaik  POST /v1/messages  502 Bad Gateway  8ms
+localaik  POST /v1/chat/completions  200  412.183ms
+localaik  POST /v1/messages  502 Bad Gateway  8.41ms
 ```
 
-Set `LK_LOG=off` to silence per-request logging; the startup lines still print. Headers and request bodies are never logged, so credentials and prompts stay out of the log. Successful `/health` probes are skipped so the log stays focused on real traffic.
+Set `LK_LOG=off` to silence per-request logging; the startup lines still print. Only `off` disables it, so `LK_LOG=0` and `LK_LOG=false` leave logging on. Headers and request bodies are never logged, so credentials and prompts stay out of the log. Successful `/health` probes are skipped so the log stays focused on real traffic.
 
 
 ## Bring your own model server (`:proxy`)
